@@ -56,6 +56,6 @@ def build_planner_options(repo_path: str, model: str) -> ClaudeAgentOptions:
         system_prompt=_SYSTEM_PROMPT,
         tools=PLANNER_TOOLS,
         allowed_tools=PLANNER_TOOLS,
-        permission_mode="bypassPermissions",
+        permission_mode="acceptEdits",
         setting_sources=["user", "project", "local"],
     )

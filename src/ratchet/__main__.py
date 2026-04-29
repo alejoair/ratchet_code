@@ -103,7 +103,10 @@ def main() -> None:
     try:
         from ratchet.solve import solve  # noqa: PLC0415
 
-        asyncio.run(solve(args.repo_path, prompt, args.config))
+        extra: dict[str, object] = {}
+        if args.model is not None:
+            extra["model"] = args.model
+        asyncio.run(solve(args.repo_path, prompt, args.config, **extra))
     except NotImplementedError:
         logger.warning("solve() not yet implemented — producing empty patch")
     except Exception as exc:  # noqa: BLE001

@@ -12,6 +12,9 @@ dependencies = [
     "pydantic>=2.0",
 ]
 
+[project.scripts]
+ratchet = "ratchet.__main__:main"
+
 [project.optional-dependencies]
 dev = [
     "mypy>=1.10",

@@ -9,6 +9,7 @@ ratchet/
 ├── CLAUDE.md
 ├── src/ratchet/
 │   ├── __init__.py
+│   ├── __main__.py
 │   ├── config.py
 │   ├── claude_md.py
 │   ├── state.py
@@ -45,6 +46,24 @@ ratchet/
 
 ### Module responsibilities
 
+`__main__.py` — CLI entry point. Accepts `repo_path` positional arg plus
+`--prompt TEXT` or `--prompt-file PATH`, `--model`, `--max-turns`,
+`--cost-limit`, `--config`. Calls `solve()` and emits a
+`RATCHET_METRICS:{...}` JSON line to stdout for the vexp-swe-bench harness.
+Installed as the `ratchet` console script via `pyproject.toml`.
+
+`solve.py` — `async def solve(repo_path, request, config_path, model) -> str`.
+Entry point for library callers. Builds planner options via
+`build_planner_options()`, runs a one-shot `query()` session, logs the
+`ResultMessage` (turns, cost), and returns `git diff HEAD`.
+Until the orchestrator and catalog are wired up, this is the sole execution
+path and calls the planner directly.
+
+`plan/planner.py` — `build_planner_options(repo_path, model) -> ClaudeAgentOptions`.
+Configures the planner session: full Claude Code toolset (`PLANNER_TOOLS`),
+`permission_mode="acceptEdits"`, `allowed_tools=PLANNER_TOOLS`,
+`setting_sources=["user", "project", "local"]`. Does not run the session.
+
 `plan/schema.py` — all Pydantic models. No I/O, no side effects. Pure data definitions.
 
 `plan/store.py` — `PlanStore` and `TaskStore`. Stateful, asyncio-locked. No SDK calls. No business logic beyond the rules defined in 03_planstore.md and 03b_taskstore.md.
@@ -57,8 +76,6 @@ ratchet/
 
 `plan/catalog.py` — in-process MCP server (`ratchet_catalog`) with all custom tools: Task CRUD, Plan CRUD (add_*_step, edit_step, remove_step, insert_step_after, view_plan, submit_plan), and the `step` execution tool. All tools access state via `ContextVar`. Contains `check_prerequisites`.
 
-`plan/planner.py` — builds `ClaudeAgentOptions` for the planner session. The planner model, system prompt, tools (Read + ratchet_catalog MCP), and setting_sources=["project"]. Does not run the session itself; that is orchestrator's job.
-
 `exec/executor.py` — `execute_step(step, cfg, repo_path, state, restrictions, prev_context) -> StepResult`. Builds options with `TOOLS_BY_STEP_TYPE` sandbox, runs SDK client, captures StepOutput via `output_format`.
 
 `exec/validator.py` — `validate(step, result, cfg, repo_path) -> ValidationVerdict`. Level 1 is subprocess; levels 2-5 are SDK clients with read-only sandbox and `output_format`.
@@ -69,9 +86,16 @@ ratchet/
 
 `orchestrator.py` — starts the planner session as a live ClaudeSDKClient, injects the ratchet_catalog MCP server (with ContextVars bound to active PlanStore, TaskStore, State, Config, repo_path), streams messages to/from the user.
 
-`solve.py` — `async def solve(repo_path, request, config_path) -> str`. Entry point. Loads config, instantiates stores, calls orchestrator, returns `git diff`.
-
 ### Data flow
+
+#### Current (planner-only)
+
+1. `ratchet <repo_path> --prompt ...` → `solve(repo_path, request, model)`
+2. `solve()` calls `build_planner_options()` and runs `query(prompt, options)`.
+3. Planner has full Claude Code toolset and edits the repo directly.
+4. On session end, `solve()` runs `git diff HEAD` and returns the patch.
+
+#### Target (full pipeline — not yet implemented)
 
 1. User message → orchestrator → planner session (live SDK client).
 2. Planner calls Task tools to define the task, then Plan tools to build the plan.
@@ -99,6 +123,29 @@ They are defined in `plan/catalog.py` and read by every tool in `ratchet_catalog
 `tools` in `ClaudeAgentOptions` = real sandbox (what the LLM sees).
 `allowed_tools` = auto-approval list (what runs without a permission prompt).
 Always set both to the same list. Never rely on `disallowed_tools` alone to sandbox.
+
+`permission_mode="bypassPermissions"` is blocked by the Claude Code CLI when
+running as root. Use `"acceptEdits"` combined with a full `allowed_tools` list
+to achieve equivalent auto-approval behavior.
+
+### vexp-swe-bench integration
+
+The harness adapter lives in the cloned `vexp-swe-bench` repo at
+`src/agents/ratchet.ts`. It spawns `ratchet <repo_path> --prompt-file <tmp>`
+and parses the `RATCHET_METRICS:` line from stdout. Registered in
+`src/agents/registry.ts` as `"ratchet"`.
+
+To run a benchmark subset:
+```bash
+# Install ratchet in a Python 3.12 venv
+python3.12 -m venv /opt/ratchet-venv
+/opt/ratchet-venv/bin/pip install -e .
+ln -sf /opt/ratchet-venv/bin/ratchet /usr/local/bin/ratchet
+
+# Run 3 instances
+cd vexp-swe-bench
+node dist/cli.js run --agent ratchet --instances id1,id2,id3 --no-vexp
+```
 
 ## restrictions
 

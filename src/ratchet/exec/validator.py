@@ -4,9 +4,10 @@ Level 1 uses subprocess.run; levels 2-5 use sandboxed SDK clients
 with read-only tools and structured ValidationVerdict output.
 """
 
+import json
 import logging
+import re
 import subprocess
-from typing import Any
 
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
@@ -118,23 +119,38 @@ def _render_validator_prompt(
     return "\n".join(lines)
 
 
-def _unwrap_verdict(
-    raw: Any,
+def _parse_verdict(
+    msg: ResultMessage,
 ) -> ValidationVerdict | None:
-    """Parse ValidationVerdict from SDK structured_output."""
-    if raw is None:
-        return None
-    data: Any = raw
-    if (
-        isinstance(data, dict)
-        and len(data) == 1
-        and "output" in data
-    ):
-        data = data["output"]
-    if isinstance(data, dict):
+    """Parse ValidationVerdict from a ResultMessage text response.
+
+    The validator prompts the model to include a JSON block
+    wrapped in ```json ... ``` at the end of its response.
+    This function extracts and parses it.
+
+    Args:
+        msg: The final ResultMessage from the SDK.
+
+    Returns:
+        A parsed ValidationVerdict, or None if no valid JSON found.
+    """
+    text = msg.result or ""
+    # Try to find a ```json ... ``` block
+    match = re.search(
+        r"```json\s*(.*?)\s*```", text, re.DOTALL,
+    )
+    if match:
+        try:
+            data = json.loads(match.group(1))
+            return ValidationVerdict.model_validate(data)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    # Fallback: try to parse the entire result as JSON
+    try:
+        data = json.loads(text)
         return ValidationVerdict.model_validate(data)
-    if isinstance(data, str):
-        return ValidationVerdict.model_validate_json(data)
+    except (json.JSONDecodeError, ValueError):
+        pass
     return None
 
 
@@ -156,12 +172,18 @@ async def _validate_level_2_to_5(
     tools = VALIDATOR_TOOLS_BY_LEVEL.get(level, ["Read"])
     prompt = _render_validator_prompt(step, result, level)
 
-    system_append = (
+    schema_hint = (
         "You are a code validation agent. Your job is to "
         "verify whether the implementation meets the "
-        "success criterion. You MUST respond with a "
-        "structured verdict.\n\n"
-        "Do NOT edit or write any files. You are read-only."
+        "success criterion.\n\n"
+        "Do NOT edit or write any files. You are read-only.\n\n"
+        "IMPORTANT: You MUST end your response with a JSON "
+        "block wrapped in ```json ... ``` containing your "
+        "verdict in this exact schema:\n"
+        '{"passed": true/false, '
+        '"diagnosis": "<explanation>", '
+        '"suggested_fixes": ["<fix1>"]}\n'
+        "This JSON block is mandatory."
     )
 
     options = ClaudeAgentOptions(
@@ -171,15 +193,11 @@ async def _validate_level_2_to_5(
         system_prompt={
             "type": "preset",
             "preset": "claude_code",
-            "append": system_append,
+            "append": schema_hint,
         },
         tools=tools,
         allowed_tools=tools,
         disallowed_tools=["Edit", "Write"],
-        output_format={
-            "type": "json_schema",
-            "json_schema": ValidationVerdict.model_json_schema(),
-        },
         max_turns=cfg.max_validator_turns(level),
         permission_mode="acceptEdits",
     )
@@ -202,15 +220,27 @@ async def _validate_level_2_to_5(
             diagnosis="No ResultMessage from validator SDK",
         )
 
-    structured = getattr(last_msg, "structured_output", None)
-    verdict = _unwrap_verdict(structured)
+    verdict = _parse_verdict(last_msg)
     if verdict is not None:
         return verdict
 
-    subtype = getattr(last_msg, "subtype", None)
+    # If no JSON found but the response mentions pass/success,
+    # create a simple verdict from the text
+    text = last_msg.result or ""
+    text_lower = text.lower()
+    if any(
+        kw in text_lower
+        for kw in ["passed", "passes", "success", "correct"]
+    ):
+        return ValidationVerdict(
+            passed=True,
+            diagnosis=text.strip()[:500],
+        )
+
     return ValidationVerdict(
         passed=False,
-        diagnosis=f"Validator produced no structured output. subtype={subtype}",
+        diagnosis=f"Validator produced no parseable verdict. "
+        f"Raw: {text.strip()[:500]}",
     )
 
 

@@ -7,7 +7,11 @@ the ratchet_catalog MCP server, and streams messages to/from the user.
 import logging
 import subprocess
 
-from claude_agent_sdk import ClaudeAgentOptions, query
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ResultMessage,
+    query,
+)
 
 from ratchet.config import Config
 from ratchet.plan.catalog import (
@@ -17,6 +21,7 @@ from ratchet.plan.catalog import (
 )
 from ratchet.plan.planner import PLANNER_TOOLS
 from ratchet.plan.store import PlanStore, TaskStore
+from ratchet.solve import SolveResult, _extract_metrics
 from ratchet.state import State
 
 logger = logging.getLogger(__name__)
@@ -48,7 +53,7 @@ async def run_orchestrated(
     request: str,
     cfg: Config,
     model: str,
-) -> str:
+) -> SolveResult:
     """Run the full ratchet pipeline with orchestrator.
 
     Creates the stores, binds ContextVars, builds the planner
@@ -63,7 +68,7 @@ async def run_orchestrated(
         model: Claude model ID for the planner.
 
     Returns:
-        The output of ``git diff HEAD`` after the session ends.
+        A SolveResult with patch and usage metrics.
     """
     task_store = TaskStore()
     plan_store = PlanStore()
@@ -88,14 +93,17 @@ async def run_orchestrated(
         system_prompt=_SYSTEM_PROMPT,
         tools=all_tools,
         allowed_tools=all_tools,
-        mcp_servers=[catalog],
+        mcp_servers={"ratchet_catalog": catalog},
         permission_mode="acceptEdits",
         max_turns=cfg.budgets.max_planner_turns,
     )
 
+    last_result: ResultMessage | None = None
     async for message in query(
         prompt=request, options=options,
     ):
+        if isinstance(message, ResultMessage):
+            last_result = message
         logger.debug(
             "Orchestrator message: %s",
             type(message).__name__,
@@ -109,5 +117,16 @@ async def run_orchestrated(
         check=False,
     )
 
-    logger.info("Orchestrator session complete")
-    return diff.stdout
+    result = SolveResult(patch=diff.stdout)
+    if last_result is not None:
+        _extract_metrics(result, last_result)
+        logger.info(
+            "Orchestrator session complete — "
+            "turns: %d, cost: $%.4f",
+            result.num_turns,
+            result.cost_usd,
+        )
+    else:
+        logger.info("Orchestrator session complete (no metrics)")
+
+    return result

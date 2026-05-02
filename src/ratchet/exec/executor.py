@@ -5,7 +5,9 @@ briefing as the user prompt, runs the SDK query, and captures the
 structured StepOutput.
 """
 
+import json
 import logging
+import re
 from typing import Any
 
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
@@ -128,6 +130,44 @@ def _unwrap_structured_output(
     return None
 
 
+def _parse_step_output(
+    msg: ResultMessage,
+) -> StepOutput | None:
+    """Parse StepOutput from a ResultMessage text response.
+
+    The executor prompts the model to include a JSON block
+    wrapped in ```json ... ``` at the end of its response.
+    This function extracts and parses it.
+
+    Args:
+        msg: The final ResultMessage from the SDK.
+
+    Returns:
+        A parsed StepOutput, or None if no valid JSON found.
+    """
+    text = msg.result or ""
+    # Try to find a ```json ... ``` block
+    match = re.search(
+        r"```json\s*(.*?)\s*```", text, re.DOTALL,
+    )
+    if match:
+        try:
+            data = json.loads(match.group(1))
+            return StepOutput.model_validate(data)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    # Fallback: try to parse the entire result as JSON
+    try:
+        data = json.loads(text)
+        return StepOutput.model_validate(data)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Last resort: wrap the result text as a summary
+    if text.strip():
+        return StepOutput(summary=text.strip()[:500])
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -167,6 +207,16 @@ async def execute_step(
         step.type, ["Read"],
     )
 
+    schema_hint = (
+        "\n\nIMPORTANT: After completing the task, you MUST "
+        "end your response with a JSON block wrapped in "
+        "```json ... ``` containing your output in this "
+        "exact schema:\n"
+        '{"summary": "<what you did>", '
+        '"artifacts": {}, "notes": ""}\n'
+        "This JSON block is mandatory."
+    )
+
     options = ClaudeAgentOptions(
         model=cfg.executor_model_for(step.type),
         cwd=repo_path,
@@ -174,14 +224,10 @@ async def execute_step(
         system_prompt={
             "type": "preset",
             "preset": "claude_code",
-            "append": system_append,
+            "append": system_append + schema_hint,
         },
         tools=tools,
         allowed_tools=tools,
-        output_format={
-            "type": "json_schema",
-            "json_schema": StepOutput.model_json_schema(),
-        },
         max_turns=cfg.budgets.max_executor_turns,
         permission_mode="acceptEdits",
     )
@@ -219,10 +265,7 @@ async def execute_step(
             error=f"SDK session ended with subtype: {subtype}",
         )
 
-    structured = getattr(
-        last_result, "structured_output", None,
-    )
-    output = _unwrap_structured_output(structured)
+    output = _parse_step_output(last_result)
 
     if output is None:
         return StepResult(
@@ -231,7 +274,7 @@ async def execute_step(
             success=False,
             error=(
                 "Executor completed but produced no "
-                "structured output"
+                "parseable JSON output"
             ),
         )
 

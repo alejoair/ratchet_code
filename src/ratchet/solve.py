@@ -170,8 +170,7 @@ async def _solve_orchestrated(
         model: Claude model ID.
 
     Returns:
-        SolveResult with patch (no per-step metrics
-        available in orchestrated mode yet).
+        SolveResult with patch and usage metrics.
     """
     from ratchet.orchestrator import (  # noqa: PLC0415
         run_orchestrated,
@@ -182,11 +181,9 @@ async def _solve_orchestrated(
             models={"planner": model},
         )
 
-    patch = await run_orchestrated(
+    return await run_orchestrated(
         repo_path=repo_path,
         request=request,
         cfg=cfg,
         model=model,
     )
-
-    return SolveResult(patch=patch)

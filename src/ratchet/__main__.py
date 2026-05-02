@@ -94,7 +94,6 @@ def main() -> None:
         "cost_usd": 0.0,
         "num_turns": 0,
         "duration_ms": 0,
-        "tool_calls": {},
     }
 
     start_ms = int(time.time() * 1000)
@@ -103,20 +102,36 @@ def main() -> None:
     try:
         from ratchet.solve import solve  # noqa: PLC0415
 
-        extra: dict[str, object] = {}
+        extra: dict[str, str] = {}
         if args.model is not None:
             extra["model"] = args.model
-        asyncio.run(solve(args.repo_path, prompt, args.config, **extra))
+        result = asyncio.run(
+            solve(args.repo_path, prompt, args.config, **extra),
+        )
+        metrics["input_tokens"] = result.input_tokens
+        metrics["output_tokens"] = result.output_tokens
+        metrics["cache_read_tokens"] = result.cache_read_tokens
+        metrics["cache_creation_tokens"] = (
+            result.cache_creation_tokens
+        )
+        metrics["cost_usd"] = result.cost_usd
+        metrics["num_turns"] = result.num_turns
     except NotImplementedError:
-        logger.warning("solve() not yet implemented — producing empty patch")
+        logger.warning(
+            "solve() not yet implemented — producing empty patch",
+        )
     except Exception as exc:  # noqa: BLE001
-        logger.error("ratchet solve failed: %s", exc, exc_info=True)
+        logger.error(
+            "ratchet solve failed: %s", exc, exc_info=True,
+        )
         exit_code = 1
     finally:
         metrics["duration_ms"] = int(time.time() * 1000) - start_ms
 
     # Always emit metrics so the harness adapter can parse them.
-    print(f"RATCHET_METRICS:{json.dumps(metrics)}", flush=True)
+    print(
+        f"RATCHET_METRICS:{json.dumps(metrics)}", flush=True,
+    )
     sys.exit(exit_code)
 
 

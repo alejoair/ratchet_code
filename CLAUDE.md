@@ -31,6 +31,25 @@ ratchet/
     └── swebench_adapter.py
 ```
 
+## design docs (Google Drive)
+
+All design documents live in the "Ratchet Code" folder on Google Drive
+(folder ID: `1Q4dIWjZnAv76DR2IKUvTROGysVAEALJk`).
+
+| Document | Drive ID | Description |
+|---|---|---|
+| `01_overview.md` | `1XsyG_r3WDVOsfbx552vO8rM4jzZZWTq2` | High-level project purpose, layout, and three-agent architecture summary (planner, executor, validator). |
+| `02_data_model.md` | `1aySkNXz6E4E-Iuj_P1b7h7OzRBJrhS51` | Canonical Pydantic v2 definitions for Task, Step, ValidatorSpec, StepOutput, StepResult, ValidationVerdict, and State. Source of truth for field names and types. |
+| `03_planstore.md` | `1BkMfRQf5adOzJyUBKr6fCwciShuX7Pbq` | PlanStore class API (add_step, edit_step, remove_step, insert_step_after, mark_*, view, submit, next_runnable_id) and all mutation rules (lock, status guards, DAG constraints). |
+| `03b_taskstore.md` | `1i3OKuJw6P56BS5ssfh9aeZBF9gzfRFLR` | TaskStore class API (create, get, update_*, set_*, view) and rules. Single active task per session, status lifecycle enforcement. |
+| `04_catalog_tools.md` | `19fyHSpBiNE8JbdqbwCa2rNezbuyu8vpQ` | Full specification of the `ratchet_catalog` MCP server: Task tools (create_task, update_task_what, view_task), Plan tools (add_*_step, edit_step, remove_step, insert_step_after, view_plan, submit_plan), the `step` execution tool contract, and prerequisite check rules. |
+| `05_executor_validator.md` | `1OfO4AwUL1qE-KAUTVwsUEKCkyqKWlVhf` | Executor options construction (TOOLS_BY_STEP_TYPE sandbox, output_format, step prompt rendering), validator levels 1-5 (tools, turns, behavior), and hooks (ruff_on_edit, commit_format_check, bash_whitelist, validator_no_write). |
+| `06_config.md` | `18M4af6OrIAY1rZelarGkChk3AQEj3yLB` | ratchet.config.json schema, Config Pydantic model (ExecutorModels, ValidationConfig, BudgetConfig, HooksConfig), CLAUDE.md contract, solve() entry point, and SWE-bench adapter. |
+| `RATCHET_OVERVIEW.md` | `1owEe267C-jofBb-KTwXiINxJ3GpNUEnQ` | Narrative overview: architecture rationale, data model summary, CLAUDE.md contract, configuration, non-obvious design decisions, and current status. |
+| `RATCHET_SPEC.md` | `1qHl0HV5CIjgkLt5ERBGniXrOi-63OX5o` | Complete specification combining all numbered docs (01-06) into a single reference: data model, PlanStore rules, catalog tools, executor, validator, hooks, config, entry point, and critical API notes. |
+| `RATCHET_THEORY.md` | `1iVWZMLMAh2d8222xajzJzNXndhNr4mt3` | Theoretical foundations: core hypothesis on phase separation, tool restriction vs prompt instruction, typed plans as tool calls, prerequisites as first-class concept, planner as intelligent layer, connection to Plan-and-Execute/MFR-PDDL literature, validation as configurable dimension, no repair loop rationale, and scope limitations. |
+| `CLAUDE.md` (Drive copy) | `1InKa4Vg8mWociTT2MqUPQWS-b9Epl7XS` | Canonical CLAUDE.md template from the design docs. Defines file_tree, architecture (entities, module responsibilities, data flow, ContextVars, SDK notes), and restrictions. |
+
 ## architecture
 
 ### Entities and their locations
@@ -43,6 +62,85 @@ ratchet/
 - `State` — `state.py`
 - `Config`, `ValidationConfig`, `BudgetConfig`, `HooksConfig` — `config.py`
 - `ClaudeMd` — `claude_md.py`
+
+### Data models (`plan/schema.py`)
+
+#### StepType (StrEnum)
+
+Step classification used to select executor sandbox and model.
+
+| Value | Description |
+|---|---|
+| `discovery_step` | Exploration and analysis, no code changes |
+| `implement_step` | Primary code implementation |
+| `simple_task_step` | Small, straightforward task |
+| `verify_step` | Run tests or verification checks |
+| `update_docs_step` | Documentation updates only |
+
+#### StepIntent (StrEnum)
+
+Semantic intent of a step, used for reporting and routing.
+
+Values: `new_feature`, `modify`, `bugfix`, `refactor`, `test`, `config`, `docs`
+
+#### ValidatorSpec
+
+Validation configuration attached to each step.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `level` | `int` (1-5) | required | Validation depth: 1 = subprocess, 2-5 = SDK client with increasing turn budgets |
+| `success_criterion` | `str` | required | Human-readable pass/fail condition |
+| `command` | `str \| None` | `None` | Shell command for level 1 validation |
+| `extra_context` | `str \| None` | `None` | Additional context for levels 2-5 |
+
+#### Step
+
+Core unit of execution within a plan.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `id` | `str` | required | Unique step identifier |
+| `type` | `StepType` | required | Step classification (determines executor sandbox and model) |
+| `goal` | `str` | required | Short description of what the step must accomplish |
+| `briefing` | `str` | required | Detailed instructions for the executor agent |
+| `target_files` | `list[str]` | `[]` | Existing files this step will modify |
+| `creates_files` | `list[str]` | `[]` | New files this step will create |
+| `deletes_files` | `list[str]` | `[]` | Files this step will delete |
+| `depends_on` | `list[str]` | `[]` | Step IDs that must complete before this step |
+| `validator` | `ValidatorSpec` | required | Validation spec for this step |
+| `intent` | `StepIntent \| None` | `None` | Semantic intent hint |
+
+#### StepOutput
+
+Returned by the executor via `output_format`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `summary` | `str` | required | What the executor did |
+| `artifacts` | `dict` | `{}` | Key-value metadata produced |
+| `notes` | `str` | `""` | Additional observations |
+
+#### StepResult
+
+Internal struct used by the executor module before validation.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `step_id` | `str` | required | Reference to the executed step |
+| `output` | `StepOutput \| None` | required | Executor output if successful |
+| `success` | `bool` | required | Whether execution completed without error |
+| `error` | `str \| None` | `None` | Error message if execution failed |
+
+#### ValidationVerdict
+
+Returned by the validator. Levels 2-5 produce it via `output_format`; level 1 constructs it directly from `subprocess.run`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `passed` | `bool` | required | Whether validation succeeded |
+| `diagnosis` | `str` | `""` | Explanation of the verdict |
+| `suggested_fixes` | `list[str]` | `[]` | Actionable fixes if validation failed |
 
 ### Module responsibilities
 
@@ -66,15 +164,15 @@ Configures the planner session: full Claude Code toolset (`PLANNER_TOOLS`),
 
 `plan/schema.py` — all Pydantic models. No I/O, no side effects. Pure data definitions.
 
-`plan/store.py` — `PlanStore` and `TaskStore`. Stateful, asyncio-locked. No SDK calls. No business logic beyond the rules defined in 03_planstore.md and 03b_taskstore.md.
+`plan/store.py` — `PlanStore` and `TaskStore`. Stateful, asyncio-locked. No SDK calls. No business logic beyond the rules defined in 03_planstore.md and 03b_taskstore.md. **Implemented**: TaskStore (create, get, update_status, update_description, delete, list_all) and PlanStore (add_step, edit_step, remove_step, insert_step_after, mark_in_progress, mark_completed, mark_failed, get_step, get_status, get_output, get_verdict, next_runnable_id, view, submit). All mutation rules from the spec are enforced.
 
-`state.py` — `State` class. Holds logical outputs (StepOutput) indexed by step_id. No asyncio lock needed (single-writer: plan_executor).
+`state.py` — `State` class. Holds logical outputs (StepOutput) indexed by step_id. No asyncio lock needed (single-writer: plan_executor). **Implemented**: record(), resolve(), get().
 
 `config.py` — `Config` and sub-models. Loads from `ratchet.config.json`. Provides `executor_model_for(step_type)` and `validator_model_for(level)`.
 
 `claude_md.py` — `parse_claude_md(repo_path) -> ClaudeMd`. Parses the three required sections (file_tree, architecture, restrictions). Raises `ValueError` if any section is missing.
 
-`plan/catalog.py` — in-process MCP server (`ratchet_catalog`) with all custom tools: Task CRUD, Plan CRUD (add_*_step, edit_step, remove_step, insert_step_after, view_plan, submit_plan), and the `step` execution tool. All tools access state via `ContextVar`. Contains `check_prerequisites`.
+`plan/catalog.py` — in-process MCP server (`ratchet_catalog`) with all custom tools: Task CRUD, Plan CRUD (add_*_step, edit_step, remove_step, insert_step_after, view_plan, submit_plan), and the `step` execution tool. All tools access state via `ContextVar`. Contains `check_prerequisites`. **Implemented**: 5 Task tools (task_create, task_get, task_list, task_update, task_delete) and 10 Plan tools (add_discovery_step, add_implement_step, add_simple_task_step, add_verify_step, add_update_docs_step, edit_step, remove_step, insert_step_after, view_plan, submit_plan). ContextVars for _task_store, _plan_store, _state, _repo_path. `bind_catalog_context(task_store, plan_store, state, repo_path)`. **Not yet**: the `step` execution tool, `check_prerequisites`, `_config` ContextVar.
 
 `exec/executor.py` — `execute_step(step, cfg, repo_path, state, restrictions, prev_context) -> StepResult`. Builds options with `TOOLS_BY_STEP_TYPE` sandbox, runs SDK client, captures StepOutput via `output_format`.
 
@@ -90,19 +188,38 @@ Configures the planner session: full Claude Code toolset (`PLANNER_TOOLS`),
 
 #### Current (planner-only)
 
-1. `ratchet <repo_path> --prompt ...` → `solve(repo_path, request, model)`
+1. `ratchet <repo_path> --prompt ...` -> `solve(repo_path, request, model)`
 2. `solve()` calls `build_planner_options()` and runs `query(prompt, options)`.
 3. Planner has full Claude Code toolset and edits the repo directly.
 4. On session end, `solve()` runs `git diff HEAD` and returns the patch.
 
-#### Target (full pipeline — not yet implemented)
+#### Target (full pipeline)
 
-1. User message → orchestrator → planner session (live SDK client).
+1. User message -> orchestrator -> planner session (live SDK client).
 2. Planner calls Task tools to define the task, then Plan tools to build the plan.
 3. Planner calls `step(step_id?, prev_context?)` to execute each step.
-4. `step` tool body (plan_executor.py) → executor → validator → updates PlanStore + State → returns verdict JSON to planner.
+4. `step` tool body (plan_executor.py) -> executor -> validator -> updates PlanStore + State -> returns verdict JSON to planner.
 5. Planner reacts to verdict, calls more plan tools or `step` as needed.
 6. On session end, orchestrator runs `git diff` and returns the result.
+
+### Implementation status
+
+| Module | Status | Notes |
+|---|---|---|
+| `plan/schema.py` | Done | All models: Task, TaskDescription, TaskStatus, TaskCategory, Step, StepType, StepIntent, ValidatorSpec, StepOutput, StepResult, ValidationVerdict |
+| `plan/store.py` | Done | TaskStore + PlanStore with all mutation rules from spec |
+| `state.py` | Done | State with record(), resolve(), get() |
+| `plan/catalog.py` | Partial | Task CRUD + Plan CRUD tools done. Missing: `step` execution tool, `check_prerequisites`, `_config` ContextVar |
+| `plan/planner.py` | Done | build_planner_options() |
+| `config.py` | Stub | Needs implementation |
+| `claude_md.py` | Stub | Needs implementation |
+| `__main__.py` | Stub | Needs implementation |
+| `solve.py` | Stub | Needs implementation |
+| `exec/executor.py` | Empty | Needs implementation |
+| `exec/validator.py` | Empty | Needs implementation |
+| `exec/hooks.py` | Empty | Needs implementation |
+| `exec/plan_executor.py` | Empty | Needs implementation |
+| `orchestrator.py` | Empty | Needs implementation |
 
 ### ContextVar bindings
 
@@ -162,3 +279,98 @@ node dist/cli.js run --agent ratchet --instances id1,id2,id3 --no-vexp
 - All errors raised must be typed exceptions. No bare `raise Exception(...)`.
 - `claude-agent-sdk>=0.1.69` pinned in pyproject.toml.
 - `pydantic>=2.0` pinned in pyproject.toml.
+
+## Project Context (Auto-generated)
+
+> **Nota**: Esta sección se genera automáticamente antes de cada query.
+> No la edites manualmente ya que se sobrescribirá.
+>
+> Providers activos: generate_system_context, generate_extended_system_context, generate_filetree_context, generate_stats_context, generate_git_context, generate_git_status_context
+
+### System Info
+
+- **OS**: 🪟 Windows 11 (AMD64)
+- **User**: `user@DESKTOP-92K2Q7P`
+- **Home**: `C:\Users\user`
+- **Shell**: `C:\WINDOWS\system32\cmd.exe`
+- **Python**: `3.14.2` → `C:\Python314\python.exe`
+- **Date/Time**: 2026-05-02 10:42:52 (SA Pacific Standard Time)
+- **Unix Timestamp**: `1777736572`
+
+
+
+### Extended System Info
+
+- **LANG**: `unknown`
+- **TERM**: `unknown`
+- **PATH**:
+  ```
+  C:\Python314\Scripts\;C:\Python314\;C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;
+  ... C:\Users\user\AppData\Roaming\Python\Python314\Scripts;C:\Users\user\AppData\Local\Programs\Microsoft VS Code\bin;C:\Users\user\.lmstudio\bin
+  ```
+
+
+
+### File Tree
+
+```
+ratchet_code/
+├── examples/
+│   └── swebench_adapter.py
+├── src/
+│   └── ratchet/
+│       ├── exec/
+│       │   ├── __init__.py
+│       │   ├── executor.py
+│       │   ├── hooks.py
+│       │   ├── plan_executor.py
+│       │   └── validator.py
+│       ├── plan/
+│       │   ├── __init__.py
+│       │   ├── catalog.py
+│       │   ├── planner.py
+│       │   ├── schema.py
+│       │   └── store.py
+│       ├── __init__.py
+│       ├── __main__.py
+│       ├── claude_md.py
+│       ├── config.py
+│       ├── orchestrator.py
+│       ├── solve.py
+│       └── state.py
+├── .gitignore
+├── =2.0
+├── CLAUDE.md
+├── npm
+├── pyproject.toml
+└── ratchet.config.json
+```
+
+### Project Stats
+
+- **Python files**: 18
+- **JS/TS files**: 0
+- **Total tracked files**: 18
+
+### Git Info
+
+- **Branch**: `claude/download-claude-md-HTScD`
+  - 4fc4d79 feat(catalog): implement Task CRUD tools in ratchet_catalog MCP server
+  - df617e1 docs(claude-md): update to reflect current implementation state
+  - 15e1233 fix(planner): use acceptEdits permission mode instead of bypassPermissions
+
+### Git Status
+
+```
+  M CLAUDE.md
+   M src/ratchet/__main__.py
+   M src/ratchet/plan/catalog.py
+   M src/ratchet/plan/schema.py
+   M src/ratchet/plan/store.py
+   M src/ratchet/solve.py
+   M src/ratchet/state.py
+  ?? =2.0
+  ?? npm
+```
+
+---

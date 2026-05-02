@@ -60,7 +60,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         default=None,
-        help="Path to ratchet.config.json (default: <repo_path>/ratchet.config.json)",
+        help=(
+            "Path to ratchet.config.json "
+            "(default: <repo_path>/ratchet.config.json)"
+        ),
+    )
+    parser.add_argument(
+        "--orchestrated",
+        action="store_true",
+        default=False,
+        dest="orchestrated",
+        help=(
+            "Use full pipeline with catalog MCP, "
+            "executor, and validator"
+        ),
     )
     return parser
 
@@ -102,11 +115,17 @@ def main() -> None:
     try:
         from ratchet.solve import solve  # noqa: PLC0415
 
-        extra: dict[str, str] = {}
+        kw: dict[str, str] = {}
         if args.model is not None:
-            extra["model"] = args.model
+            kw["model"] = args.model
         result = asyncio.run(
-            solve(args.repo_path, prompt, args.config, **extra),
+            solve(
+                args.repo_path,
+                prompt,
+                args.config,
+                orchestrated=args.orchestrated,
+                **kw,
+            ),
         )
         metrics["input_tokens"] = result.input_tokens
         metrics["output_tokens"] = result.output_tokens

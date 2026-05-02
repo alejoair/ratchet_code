@@ -6,14 +6,21 @@ orchestrator before starting a planner session. No module-level mutable state.
 
 import json
 import logging
+import os
 from contextvars import ContextVar
 from typing import Any
 
-from claude_agent_sdk import McpSdkServerConfig, create_sdk_mcp_server, tool
+from claude_agent_sdk import (
+    McpSdkServerConfig,
+    create_sdk_mcp_server,
+    tool,
+)
 
+from ratchet.config import Config
 from ratchet.plan.schema import (
     Step,
     StepIntent,
+    StepOutput,
     StepType,
     Task,
     TaskCategory,
@@ -24,6 +31,7 @@ from ratchet.plan.schema import (
 from ratchet.plan.store import (
     PlanStore,
     RatchetStoreError,
+    StepStatus,
     TaskStore,
 )
 from ratchet.state import State
@@ -32,13 +40,20 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# ContextVars -- module-level constants, values bound per-session by orchestrator
+# ContextVars
 # ---------------------------------------------------------------------------
 
-_task_store: ContextVar[TaskStore] = ContextVar("_task_store")
-_plan_store: ContextVar[PlanStore] = ContextVar("_plan_store")
+_task_store: ContextVar[TaskStore] = ContextVar(
+    "_task_store",
+)
+_plan_store: ContextVar[PlanStore] = ContextVar(
+    "_plan_store",
+)
 _state: ContextVar[State] = ContextVar("_state")
-_repo_path: ContextVar[str] = ContextVar("_repo_path")
+_repo_path: ContextVar[str] = ContextVar(
+    "_repo_path",
+)
+_config: ContextVar[Config] = ContextVar("_config")
 
 
 # ---------------------------------------------------------------------------
@@ -47,11 +62,15 @@ _repo_path: ContextVar[str] = ContextVar("_repo_path")
 
 
 class RatchetCatalogError(Exception):
-    """Base class for errors raised within ratchet_catalog tool handlers."""
+    """Base for ratchet_catalog tool errors."""
 
 
 class ContextVarNotSetError(RatchetCatalogError):
-    """Raised when a required ContextVar has not been bound by the orchestrator."""
+    """Raised when a ContextVar is not bound."""
+
+
+class PrerequisitesNotMetError(RatchetCatalogError):
+    """Raised when prerequisite checks fail."""
 
 
 # ---------------------------------------------------------------------------
@@ -60,55 +79,81 @@ class ContextVarNotSetError(RatchetCatalogError):
 
 
 def _get_task_store() -> TaskStore:
-    """Retrieve TaskStore from ContextVar.
-
-    Returns:
-        The active TaskStore for this execution context.
-
-    Raises:
-        ContextVarNotSetError: If the orchestrator has not bound the store.
-    """
+    """Retrieve TaskStore from ContextVar."""
     try:
         return _task_store.get()
     except LookupError as exc:
         raise ContextVarNotSetError(
-            "TaskStore ContextVar not set -- call bind_catalog_context() "
-            "before starting a planner session."
+            "TaskStore not set."
         ) from exc
 
 
 def _get_plan_store() -> PlanStore:
-    """Retrieve PlanStore from ContextVar.
-
-    Returns:
-        The active PlanStore for this execution context.
-
-    Raises:
-        ContextVarNotSetError: If the orchestrator has not bound the store.
-    """
+    """Retrieve PlanStore from ContextVar."""
     try:
         return _plan_store.get()
     except LookupError as exc:
         raise ContextVarNotSetError(
-            "PlanStore ContextVar not set -- call bind_catalog_context() "
-            "before starting a planner session."
+            "PlanStore not set."
+        ) from exc
+
+
+def _get_state() -> State:
+    """Retrieve State from ContextVar."""
+    try:
+        return _state.get()
+    except LookupError as exc:
+        raise ContextVarNotSetError(
+            "State not set."
+        ) from exc
+
+
+def _get_repo_path() -> str:
+    """Retrieve repo_path from ContextVar."""
+    try:
+        return _repo_path.get()
+    except LookupError as exc:
+        raise ContextVarNotSetError(
+            "repo_path not set."
+        ) from exc
+
+
+def _get_config() -> Config:
+    """Retrieve Config from ContextVar."""
+    try:
+        return _config.get()
+    except LookupError as exc:
+        raise ContextVarNotSetError(
+            "Config not set."
         ) from exc
 
 
 def _ok(data: Any) -> dict[str, Any]:
-    """Wrap serialisable data in an MCP success response."""
-    return {"content": [{"type": "text", "text": json.dumps(data, default=str)}]}
+    """Wrap data in an MCP success response."""
+    return {
+        "content": [{
+            "type": "text",
+            "text": json.dumps(data, default=str),
+        }],
+    }
 
 
 def _err(exc: Exception) -> dict[str, Any]:
     """Wrap an exception in an MCP error response."""
     return {
-        "content": [{"type": "text", "text": f"{type(exc).__name__}: {exc}"}],
+        "content": [{
+            "type": "text",
+            "text": (
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }],
         "is_error": True,
     }
 
 
-def _build_validator_spec(args: dict[str, Any]) -> ValidatorSpec:
+def _build_validator_spec(
+    args: dict[str, Any],
+) -> ValidatorSpec:
     """Construct a ValidatorSpec from tool arguments."""
     return ValidatorSpec(
         level=args["validation_level"],
@@ -118,7 +163,9 @@ def _build_validator_spec(args: dict[str, Any]) -> ValidatorSpec:
     )
 
 
-def _build_step_from_args(args: dict[str, Any]) -> Step:
+def _build_step_from_args(
+    args: dict[str, Any],
+) -> Step:
     """Build a Step from add_*_step tool arguments."""
     common: dict[str, Any] = {
         "id": args["id"],
@@ -134,32 +181,144 @@ def _build_step_from_args(args: dict[str, Any]) -> Step:
 
     step_type = StepType(args["step_type"])
 
-    if step_type in (StepType.IMPLEMENT_STEP, StepType.UPDATE_DOCS_STEP):
-        common["target_files"] = args.get("target_files", [])
-        common["creates_files"] = args.get("creates_files", [])
+    if step_type in (
+        StepType.IMPLEMENT_STEP,
+        StepType.UPDATE_DOCS_STEP,
+    ):
+        common["target_files"] = args.get(
+            "target_files", [],
+        )
+        common["creates_files"] = args.get(
+            "creates_files", [],
+        )
 
     if step_type == StepType.IMPLEMENT_STEP:
-        common["deletes_files"] = args.get("deletes_files", [])
+        common["deletes_files"] = args.get(
+            "deletes_files", [],
+        )
 
     return Step.model_validate(common)
+
+
+# ---------------------------------------------------------------------------
+# check_prerequisites
+# ---------------------------------------------------------------------------
+
+
+async def check_prerequisites(
+    step: Step,
+    store: PlanStore,
+    rp: str,
+) -> list[str]:
+    """Validate prerequisites before executing a step.
+
+    Checks:
+      1. depends_on entries exist and are COMPLETED.
+      2. For implement/update_docs: target_files exist,
+         creates_files do not exist, no duplicates.
+      3. Step status is PENDING.
+
+    Args:
+        step: The step to validate.
+        store: The active PlanStore.
+        rp: Absolute path to the repository.
+
+    Returns:
+        List of error strings (empty if all pass).
+    """
+    errors: list[str] = []
+
+    # Check dependency statuses
+    for dep_id in step.depends_on:
+        try:
+            dep_status = await store.get_status(dep_id)
+            if dep_status != StepStatus.COMPLETED:
+                errors.append(
+                    f"Dependency {dep_id!r} is "
+                    f"{dep_status!r}, not COMPLETED"
+                )
+        except Exception as exc:
+            errors.append(
+                f"Dependency {dep_id!r} not found: "
+                f"{exc}"
+            )
+
+    # File existence checks for write-capable types
+    if step.type in (
+        StepType.IMPLEMENT_STEP,
+        StepType.UPDATE_DOCS_STEP,
+    ):
+        all_files = (
+            step.target_files + step.creates_files
+        )
+        if step.type == StepType.IMPLEMENT_STEP:
+            all_files = (
+                step.target_files
+                + step.creates_files
+                + step.deletes_files
+            )
+
+        # Check for duplicates across lists
+        seen: set[str] = set()
+        for f in all_files:
+            if f in seen:
+                errors.append(
+                    f"File {f!r} in multiple lists"
+                )
+            seen.add(f)
+
+        for f in step.target_files:
+            full = os.path.join(rp, f)
+            if not os.path.exists(full):
+                errors.append(
+                    f"target_file {f!r} missing"
+                )
+
+        for f in step.creates_files:
+            full = os.path.join(rp, f)
+            if os.path.exists(full):
+                errors.append(
+                    f"creates_file {f!r} exists"
+                )
+
+        if step.type == StepType.IMPLEMENT_STEP:
+            for f in step.deletes_files:
+                full = os.path.join(rp, f)
+                if not os.path.exists(full):
+                    errors.append(
+                        f"deletes_file {f!r} missing"
+                    )
+
+    # Step must be PENDING
+    status = await store.get_status(step.id)
+    if status != StepStatus.PENDING:
+        errors.append(
+            f"Step {step.id!r} is {status!r}, "
+            f"expected PENDING"
+        )
+
+    return errors
 
 
 # ---------------------------------------------------------------------------
 # Tool input schemas
 # ---------------------------------------------------------------------------
 
-# --- Task schemas ---
-
 _TASK_CREATE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "title": {
             "type": "string",
-            "description": "Short human-readable label (max 200 chars).",
+            "description": (
+                "Short human-readable label "
+                "(max 200 chars)."
+            ),
         },
         "description": {
             "type": "string",
-            "description": "Full problem statement or issue text.",
+            "description": (
+                "Full problem statement or issue text."
+            ),
         },
         "category": {
             "type": "string",
@@ -168,26 +327,41 @@ _TASK_CREATE_SCHEMA: dict[str, Any] = {
         },
         "repo_path": {
             "type": "string",
-            "description": "Absolute path to the repository.",
+            "description": (
+                "Absolute path to the repository."
+            ),
         },
         "issue_id": {
             "type": "string",
-            "description": "Optional SWE-bench or tracker reference.",
+            "description": (
+                "Optional SWE-bench or tracker ref."
+            ),
         },
         "acceptance_criteria": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Verifiable conditions for task completion.",
+            "description": (
+                "Verifiable conditions for completion."
+            ),
         },
-        "notes": {"type": "string", "description": "Free-form planner notes."},
+        "notes": {
+            "type": "string",
+            "description": "Free-form planner notes.",
+        },
     },
-    "required": ["title", "description", "category", "repo_path"],
+    "required": [
+        "title", "description",
+        "category", "repo_path",
+    ],
 }
 
 _TASK_GET_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "task_id": {"type": "string", "description": "Hex UUID of the task."},
+        "task_id": {
+            "type": "string",
+            "description": "Hex UUID of the task.",
+        },
     },
     "required": ["task_id"],
 }
@@ -201,29 +375,52 @@ _TASK_LIST_SCHEMA: dict[str, Any] = {
 _TASK_UPDATE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "task_id": {"type": "string", "description": "Hex UUID of the task to update."},
+        "task_id": {
+            "type": "string",
+            "description": (
+                "Hex UUID of the task to update."
+            ),
+        },
         "title": {
             "type": "string",
-            "description": "New title (omit to leave unchanged).",
+            "description": (
+                "New title (omit to keep)."
+            ),
         },
-        "description": {"type": "string", "description": "New description text."},
+        "description": {
+            "type": "string",
+            "description": "New description text.",
+        },
         "category": {
             "type": "string",
             "enum": [c.value for c in TaskCategory],
             "description": "New category.",
         },
-        "repo_path": {"type": "string", "description": "New repo path."},
-        "issue_id": {"type": "string", "description": "New issue reference."},
+        "repo_path": {
+            "type": "string",
+            "description": "New repo path.",
+        },
+        "issue_id": {
+            "type": "string",
+            "description": "New issue reference.",
+        },
         "acceptance_criteria": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Replacement acceptance criteria list.",
+            "description": (
+                "Replacement criteria list."
+            ),
         },
-        "notes": {"type": "string", "description": "New notes."},
+        "notes": {
+            "type": "string",
+            "description": "New notes.",
+        },
         "status": {
             "type": "string",
             "enum": [s.value for s in TaskStatus],
-            "description": "New status (triggers transition validation).",
+            "description": (
+                "New status (validates transition)."
+            ),
         },
     },
     "required": ["task_id"],
@@ -232,48 +429,68 @@ _TASK_UPDATE_SCHEMA: dict[str, Any] = {
 _TASK_DELETE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "task_id": {"type": "string", "description": "Hex UUID of the task to delete."},
+        "task_id": {
+            "type": "string",
+            "description": (
+                "Hex UUID of the task to delete."
+            ),
+        },
     },
     "required": ["task_id"],
 }
 
-# --- Plan: common step fields used in all add_*_step schemas ---
-
 _STEP_COMMON_PROPERTIES: dict[str, Any] = {
-    "id": {"type": "string", "description": "Unique step identifier."},
+    "id": {
+        "type": "string",
+        "description": "Unique step identifier.",
+    },
     "goal": {
         "type": "string",
-        "description": "Short description of what the step must accomplish.",
+        "description": (
+            "Short description of what the "
+            "step must accomplish."
+        ),
     },
     "briefing": {
         "type": "string",
-        "description": "Detailed instructions for the executor agent.",
+        "description": (
+            "Detailed instructions for the "
+            "executor agent."
+        ),
     },
     "depends_on": {
         "type": "array",
         "items": {"type": "string"},
-        "description": "Step IDs that must complete before this step.",
+        "description": (
+            "Step IDs that must complete first."
+        ),
     },
     "success_criterion": {
         "type": "string",
-        "description": "Human-readable pass/fail condition.",
+        "description": (
+            "Human-readable pass/fail condition."
+        ),
     },
     "validation_level": {
         "type": "integer",
         "minimum": 1,
         "maximum": 5,
         "description": (
-            "Validation depth (1=subprocess, 2-5=LLM with"
-            " increasing rigor)."
+            "Validation depth (1=subprocess, "
+            "2-5=LLM with increasing rigor)."
         ),
     },
     "validator_command": {
         "type": "string",
-        "description": "Shell command for level 1 validation.",
+        "description": (
+            "Shell command for level 1 validation."
+        ),
     },
     "validator_context": {
         "type": "string",
-        "description": "Additional context for levels 2-5 validation.",
+        "description": (
+            "Extra context for levels 2-5."
+        ),
     },
     "intent": {
         "type": "string",
@@ -290,97 +507,155 @@ _STEP_COMMON_REQUIRED: list[str] = [
     "validation_level",
 ]
 
-# --- Plan: per-type schemas ---
-
 _ADD_DISCOVERY_STEP_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "step_type": {"type": "string", "const": "discovery_step"},
+        "step_type": {
+            "type": "string",
+            "const": "discovery_step",
+        },
         **_STEP_COMMON_PROPERTIES,
     },
-    "required": ["step_type", *_STEP_COMMON_REQUIRED],
+    "required": [
+        "step_type", *_STEP_COMMON_REQUIRED,
+    ],
 }
 
 _ADD_IMPLEMENT_STEP_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "step_type": {"type": "string", "const": "implement_step"},
+        "step_type": {
+            "type": "string",
+            "const": "implement_step",
+        },
         "target_files": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Existing files this step will modify.",
+            "description": (
+                "Existing files to modify."
+            ),
         },
         "creates_files": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "New files this step will create.",
+            "description": (
+                "New files to create."
+            ),
         },
         "deletes_files": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Files this step will delete.",
+            "description": "Files to delete.",
         },
         **_STEP_COMMON_PROPERTIES,
     },
-    "required": ["step_type", *_STEP_COMMON_REQUIRED],
+    "required": [
+        "step_type", *_STEP_COMMON_REQUIRED,
+    ],
 }
 
 _ADD_SIMPLE_TASK_STEP_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "step_type": {"type": "string", "const": "simple_task_step"},
+        "step_type": {
+            "type": "string",
+            "const": "simple_task_step",
+        },
         "command": {
             "type": "string",
-            "description": "Shell command to execute.",
+            "description": (
+                "Shell command to execute."
+            ),
         },
         **_STEP_COMMON_PROPERTIES,
     },
-    "required": ["step_type", *_STEP_COMMON_REQUIRED],
+    "required": [
+        "step_type", *_STEP_COMMON_REQUIRED,
+    ],
 }
 
 _ADD_VERIFY_STEP_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "step_type": {"type": "string", "const": "verify_step"},
+        "step_type": {
+            "type": "string",
+            "const": "verify_step",
+        },
         **_STEP_COMMON_PROPERTIES,
     },
-    "required": ["step_type", *_STEP_COMMON_REQUIRED],
+    "required": [
+        "step_type", *_STEP_COMMON_REQUIRED,
+    ],
 }
 
 _ADD_UPDATE_DOCS_STEP_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "step_type": {"type": "string", "const": "update_docs_step"},
+        "step_type": {
+            "type": "string",
+            "const": "update_docs_step",
+        },
         "target_files": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Existing documentation files to modify.",
+            "description": (
+                "Docs files to modify."
+            ),
         },
         "creates_files": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "New documentation files to create.",
+            "description": (
+                "New docs files to create."
+            ),
         },
         **_STEP_COMMON_PROPERTIES,
     },
-    "required": ["step_type", *_STEP_COMMON_REQUIRED],
+    "required": [
+        "step_type", *_STEP_COMMON_REQUIRED,
+    ],
 }
 
 _EDIT_STEP_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "step_id": {"type": "string", "description": "ID of the step to edit."},
+        "step_id": {
+            "type": "string",
+            "description": (
+                "ID of the step to edit."
+            ),
+        },
         "updates": {
             "type": "object",
-            "description": "Fields to update on the step.",
+            "description": (
+                "Fields to update on the step."
+            ),
             "properties": {
                 "goal": {"type": "string"},
                 "briefing": {"type": "string"},
-                "target_files": {"type": "array", "items": {"type": "string"}},
-                "creates_files": {"type": "array", "items": {"type": "string"}},
-                "deletes_files": {"type": "array", "items": {"type": "string"}},
-                "depends_on": {"type": "array", "items": {"type": "string"}},
-                "intent": {"type": "string", "enum": [i.value for i in StepIntent]},
+                "target_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "creates_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "deletes_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "depends_on": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "intent": {
+                    "type": "string",
+                    "enum": [
+                        i.value
+                        for i in StepIntent
+                    ],
+                },
             },
         },
     },
@@ -390,7 +665,12 @@ _EDIT_STEP_SCHEMA: dict[str, Any] = {
 _REMOVE_STEP_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "step_id": {"type": "string", "description": "ID of the step to remove."},
+        "step_id": {
+            "type": "string",
+            "description": (
+                "ID of the step to remove."
+            ),
+        },
     },
     "required": ["step_id"],
 }
@@ -400,7 +680,9 @@ _INSERT_STEP_AFTER_SCHEMA: dict[str, Any] = {
     "properties": {
         "anchor_id": {
             "type": "string",
-            "description": "ID of the step after which to insert.",
+            "description": (
+                "ID of the anchor step."
+            ),
         },
         "step_type": {
             "type": "string",
@@ -409,32 +691,55 @@ _INSERT_STEP_AFTER_SCHEMA: dict[str, Any] = {
         },
         "step_args": {
             "type": "object",
-            "description": "Arguments for the new step.",
+            "description": "Args for the new step.",
             "properties": {
                 "id": {"type": "string"},
                 "goal": {"type": "string"},
                 "briefing": {"type": "string"},
-                "target_files": {"type": "array", "items": {"type": "string"}},
-                "creates_files": {"type": "array", "items": {"type": "string"}},
-                "deletes_files": {"type": "array", "items": {"type": "string"}},
-                "depends_on": {"type": "array", "items": {"type": "string"}},
-                "success_criterion": {"type": "string"},
-                "validation_level": {"type": "integer", "minimum": 1, "maximum": 5},
-                "validator_command": {"type": "string"},
-                "validator_context": {"type": "string"},
+                "target_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "creates_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "deletes_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "depends_on": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "success_criterion": {
+                    "type": "string",
+                },
+                "validation_level": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5,
+                },
+                "validator_command": {
+                    "type": "string",
+                },
+                "validator_context": {
+                    "type": "string",
+                },
                 "intent": {"type": "string"},
                 "command": {"type": "string"},
             },
             "required": [
-                "id",
-                "goal",
-                "briefing",
+                "id", "goal", "briefing",
                 "success_criterion",
                 "validation_level",
             ],
         },
     },
-    "required": ["anchor_id", "step_type", "step_args"],
+    "required": [
+        "anchor_id", "step_type",
+        "step_args",
+    ],
 }
 
 _VIEW_PLAN_SCHEMA: dict[str, Any] = {
@@ -448,10 +753,32 @@ _SUBMIT_PLAN_SCHEMA: dict[str, Any] = {
     "properties": {
         "rationale": {
             "type": "string",
-            "description": "Planner's explanation of the plan.",
+            "description": (
+                "Planner explanation of the plan."
+            ),
         },
     },
     "required": ["rationale"],
+}
+
+_STEP_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "step_id": {
+            "type": "string",
+            "description": (
+                "Step ID to execute. If empty, "
+                "auto-picks the next runnable step."
+            ),
+        },
+        "prev_context": {
+            "type": "string",
+            "description": (
+                "Additional context from planner."
+            ),
+        },
+    },
+    "required": [],
 }
 
 
@@ -474,10 +801,12 @@ _DESCRIPTION_FIELDS: frozenset[str] = frozenset(
 
 @tool(
     "task_create",
-    "Create a new task with a description and acceptance criteria.",
+    "Create a new task with description.",
     _TASK_CREATE_SCHEMA,
 )
-async def _task_create_handler(args: dict[str, Any]) -> dict[str, Any]:
+async def _task_create_handler(
+    args: dict[str, Any],
+) -> dict[str, Any]:
     """Handle task_create tool calls."""
     try:
         store = _get_task_store()
@@ -487,96 +816,151 @@ async def _task_create_handler(args: dict[str, Any]) -> dict[str, Any]:
             category=TaskCategory(args["category"]),
             repo_path=args["repo_path"],
             issue_id=args.get("issue_id"),
-            acceptance_criteria=args.get("acceptance_criteria", []),
+            acceptance_criteria=args.get(
+                "acceptance_criteria", [],
+            ),
             notes=args.get("notes"),
         )
         task = await store.create(desc)
         return _ok(task.model_dump(mode="json"))
-    except (RatchetCatalogError, RatchetStoreError, ValueError) as exc:
+    except (
+        RatchetCatalogError,
+        RatchetStoreError,
+        ValueError,
+    ) as exc:
         return _err(exc)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error in task_create")
+        logger.exception("Error in task_create")
         return _err(exc)
 
 
-@tool("task_get", "Retrieve a task by its ID.", _TASK_GET_SCHEMA)
-async def _task_get_handler(args: dict[str, Any]) -> dict[str, Any]:
+@tool(
+    "task_get",
+    "Retrieve a task by its ID.",
+    _TASK_GET_SCHEMA,
+)
+async def _task_get_handler(
+    args: dict[str, Any],
+) -> dict[str, Any]:
     """Handle task_get tool calls."""
     try:
         store = _get_task_store()
         task = await store.get(args["task_id"])
         return _ok(task.model_dump(mode="json"))
-    except (RatchetCatalogError, RatchetStoreError) as exc:
+    except (
+        RatchetCatalogError,
+        RatchetStoreError,
+    ) as exc:
         return _err(exc)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error in task_get")
-        return _err(exc)
-
-
-@tool("task_list", "List all tasks sorted by creation time.", _TASK_LIST_SCHEMA)
-async def _task_list_handler(args: dict[str, Any]) -> dict[str, Any]:
-    """Handle task_list tool calls."""
-    try:
-        store = _get_task_store()
-        tasks = await store.list_all()
-        return _ok([t.model_dump(mode="json") for t in tasks])
-    except (RatchetCatalogError, RatchetStoreError) as exc:
-        return _err(exc)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error in task_list")
+        logger.exception("Error in task_get")
         return _err(exc)
 
 
 @tool(
-    "task_update", "Update task fields or transition its status.", _TASK_UPDATE_SCHEMA
+    "task_list",
+    "List all tasks sorted by creation time.",
+    _TASK_LIST_SCHEMA,
 )
-async def _task_update_handler(args: dict[str, Any]) -> dict[str, Any]:
+async def _task_list_handler(
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    """Handle task_list tool calls."""
+    try:
+        store = _get_task_store()
+        tasks = await store.list_all()
+        return _ok([
+            t.model_dump(mode="json")
+            for t in tasks
+        ])
+    except (
+        RatchetCatalogError,
+        RatchetStoreError,
+    ) as exc:
+        return _err(exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Error in task_list")
+        return _err(exc)
+
+
+@tool(
+    "task_update",
+    "Update task fields or status.",
+    _TASK_UPDATE_SCHEMA,
+)
+async def _task_update_handler(
+    args: dict[str, Any],
+) -> dict[str, Any]:
     """Handle task_update tool calls."""
     try:
         store = _get_task_store()
         task_id: str = args["task_id"]
-        present_desc_fields = _DESCRIPTION_FIELDS & args.keys()
-        new_status_raw: str | None = args.get("status")
+        present = _DESCRIPTION_FIELDS & args.keys()
+        new_status: str | None = args.get("status")
 
         task: Task | None = None
 
-        if present_desc_fields:
+        if present:
             current = await store.get(task_id)
-            merged: dict[str, Any] = current.model_dump(
-                include=_DESCRIPTION_FIELDS  # type: ignore[arg-type]
+            merged: dict[str, Any] = (
+                current.model_dump(
+                    include=_DESCRIPTION_FIELDS
+                )  # type: ignore[arg-type]
             )
-            for field in present_desc_fields:
+            for field in present:
                 merged[field] = (
-                    TaskCategory(args[field]) if field == "category" else args[field]
+                    TaskCategory(args[field])
+                    if field == "category"
+                    else args[field]
                 )
-            desc = TaskDescription.model_validate(merged)
-            task = await store.update_description(task_id, desc)
+            desc = TaskDescription.model_validate(
+                merged,
+            )
+            task = await store.update_description(
+                task_id, desc,
+            )
 
-        if new_status_raw is not None:
-            task = await store.update_status(task_id, TaskStatus(new_status_raw))
+        if new_status is not None:
+            task = await store.update_status(
+                task_id,
+                TaskStatus(new_status),
+            )
 
         if task is None:
             task = await store.get(task_id)
 
         return _ok(task.model_dump(mode="json"))
-    except (RatchetCatalogError, RatchetStoreError, ValueError) as exc:
+    except (
+        RatchetCatalogError,
+        RatchetStoreError,
+        ValueError,
+    ) as exc:
         return _err(exc)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error in task_update")
+        logger.exception("Error in task_update")
         return _err(exc)
 
 
-@tool("task_delete", "Delete a task by its ID.", _TASK_DELETE_SCHEMA)
-async def _task_delete_handler(args: dict[str, Any]) -> dict[str, Any]:
+@tool(
+    "task_delete",
+    "Delete a task by its ID.",
+    _TASK_DELETE_SCHEMA,
+)
+async def _task_delete_handler(
+    args: dict[str, Any],
+) -> dict[str, Any]:
     """Handle task_delete tool calls."""
     try:
         store = _get_task_store()
         await store.delete(args["task_id"])
         return _ok({"deleted": args["task_id"]})
-    except (RatchetCatalogError, RatchetStoreError) as exc:
+    except (
+        RatchetCatalogError,
+        RatchetStoreError,
+    ) as exc:
         return _err(exc)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error in task_delete")
+        logger.exception("Error in task_delete")
         return _err(exc)
 
 
@@ -585,224 +969,435 @@ async def _task_delete_handler(args: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _add_step_wrapper(
+    args: dict[str, Any],
+) -> tuple[PlanStore, Step]:
+    """Common logic for add_*_step handlers."""
+    store = _get_plan_store()
+    step = _build_step_from_args(args)
+    return store, step
+
+
 @tool(
     "add_discovery_step",
-    "Append a discovery step to the plan. No file declarations.",
+    "Append a discovery step.",
     _ADD_DISCOVERY_STEP_SCHEMA,
 )
-async def _add_discovery_step_handler(args: dict[str, Any]) -> dict[str, Any]:
+async def _add_discovery_step_handler(
+    args: dict[str, Any],
+) -> dict[str, Any]:
     """Handle add_discovery_step tool calls."""
     try:
-        store = _get_plan_store()
-        step = _build_step_from_args(args)
+        store, step = _add_step_wrapper(args)
         await store.add_step(step)
         return _ok(step.model_dump(mode="json"))
-    except (RatchetCatalogError, RatchetStoreError, ValueError) as exc:
+    except (
+        RatchetCatalogError,
+        RatchetStoreError,
+        ValueError,
+    ) as exc:
         return _err(exc)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error in add_discovery_step")
+        logger.exception("Error in add_discovery_step")
         return _err(exc)
 
 
 @tool(
     "add_implement_step",
-    "Append an implement step to the plan with file declarations.",
+    "Append an implement step.",
     _ADD_IMPLEMENT_STEP_SCHEMA,
 )
-async def _add_implement_step_handler(args: dict[str, Any]) -> dict[str, Any]:
+async def _add_implement_step_handler(
+    args: dict[str, Any],
+) -> dict[str, Any]:
     """Handle add_implement_step tool calls."""
     try:
-        store = _get_plan_store()
-        step = _build_step_from_args(args)
+        store, step = _add_step_wrapper(args)
         await store.add_step(step)
         return _ok(step.model_dump(mode="json"))
-    except (RatchetCatalogError, RatchetStoreError, ValueError) as exc:
+    except (
+        RatchetCatalogError,
+        RatchetStoreError,
+        ValueError,
+    ) as exc:
         return _err(exc)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error in add_implement_step")
+        logger.exception("Error in add_implement_step")
         return _err(exc)
 
 
 @tool(
     "add_simple_task_step",
-    "Append a simple task step to the plan.",
+    "Append a simple task step.",
     _ADD_SIMPLE_TASK_STEP_SCHEMA,
 )
-async def _add_simple_task_step_handler(args: dict[str, Any]) -> dict[str, Any]:
+async def _add_simple_task_step_handler(
+    args: dict[str, Any],
+) -> dict[str, Any]:
     """Handle add_simple_task_step tool calls."""
     try:
-        store = _get_plan_store()
-        step = _build_step_from_args(args)
+        store, step = _add_step_wrapper(args)
         await store.add_step(step)
         return _ok(step.model_dump(mode="json"))
-    except (RatchetCatalogError, RatchetStoreError, ValueError) as exc:
+    except (
+        RatchetCatalogError,
+        RatchetStoreError,
+        ValueError,
+    ) as exc:
         return _err(exc)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error in add_simple_task_step")
+        logger.exception("Error in add_simple_task_step")
         return _err(exc)
 
 
 @tool(
     "add_verify_step",
-    "Append a verify step to the plan.",
+    "Append a verify step.",
     _ADD_VERIFY_STEP_SCHEMA,
 )
-async def _add_verify_step_handler(args: dict[str, Any]) -> dict[str, Any]:
+async def _add_verify_step_handler(
+    args: dict[str, Any],
+) -> dict[str, Any]:
     """Handle add_verify_step tool calls."""
     try:
-        store = _get_plan_store()
-        step = _build_step_from_args(args)
+        store, step = _add_step_wrapper(args)
         await store.add_step(step)
         return _ok(step.model_dump(mode="json"))
-    except (RatchetCatalogError, RatchetStoreError, ValueError) as exc:
+    except (
+        RatchetCatalogError,
+        RatchetStoreError,
+        ValueError,
+    ) as exc:
         return _err(exc)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error in add_verify_step")
+        logger.exception("Error in add_verify_step")
         return _err(exc)
 
 
 @tool(
     "add_update_docs_step",
-    "Append an update docs step to the plan with file declarations.",
+    "Append an update docs step.",
     _ADD_UPDATE_DOCS_STEP_SCHEMA,
 )
-async def _add_update_docs_step_handler(args: dict[str, Any]) -> dict[str, Any]:
+async def _add_update_docs_step_handler(
+    args: dict[str, Any],
+) -> dict[str, Any]:
     """Handle add_update_docs_step tool calls."""
     try:
-        store = _get_plan_store()
-        step = _build_step_from_args(args)
+        store, step = _add_step_wrapper(args)
         await store.add_step(step)
         return _ok(step.model_dump(mode="json"))
-    except (RatchetCatalogError, RatchetStoreError, ValueError) as exc:
+    except (
+        RatchetCatalogError,
+        RatchetStoreError,
+        ValueError,
+    ) as exc:
         return _err(exc)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error in add_update_docs_step")
+        logger.exception("Error in add_update_docs_step")
         return _err(exc)
 
 
 @tool(
     "edit_step",
-    "Update fields on a PENDING or FAILED step. FAILED resets to PENDING.",
+    "Update fields on a PENDING/FAILED step.",
     _EDIT_STEP_SCHEMA,
 )
-async def _edit_step_handler(args: dict[str, Any]) -> dict[str, Any]:
+async def _edit_step_handler(
+    args: dict[str, Any],
+) -> dict[str, Any]:
     """Handle edit_step tool calls."""
     try:
         store = _get_plan_store()
         step_id: str = args["step_id"]
         updates: dict[str, Any] = args["updates"]
 
-        # Parse nested validator updates if present
-        validator_updates: dict[str, Any] = {}
-        clean_updates: dict[str, Any] = {}
+        # Parse nested validator updates
+        val_updates: dict[str, Any] = {}
+        clean: dict[str, Any] = {}
         for key, value in updates.items():
             if key.startswith("validator_"):
-                field_map = {
+                fmap = {
                     "validator_command": "command",
                     "validator_context": "extra_context",
                 }
-                if key in field_map:
-                    validator_updates[field_map[key]] = value
+                if key in fmap:
+                    val_updates[fmap[key]] = value
             else:
-                clean_updates[key] = value
+                clean[key] = value
 
         # Handle intent enum conversion
-        if "intent" in clean_updates and isinstance(clean_updates["intent"], str):
-            clean_updates["intent"] = StepIntent(clean_updates["intent"])
+        if "intent" in clean and isinstance(
+            clean["intent"], str
+        ):
+            clean["intent"] = StepIntent(
+                clean["intent"]
+            )
 
-        # If any validator fields were provided, merge with existing
-        if validator_updates:
+        # Merge validator updates with existing
+        if val_updates:
             current = await store.get_step(step_id)
-            current_validator = current.validator.model_dump()
-            current_validator.update(validator_updates)
-            clean_updates["validator"] = ValidatorSpec.model_validate(current_validator)
+            cv = current.validator.model_dump()
+            cv.update(val_updates)
+            clean["validator"] = (
+                ValidatorSpec.model_validate(cv)
+            )
 
-        step = await store.edit_step(step_id, clean_updates)
+        step = await store.edit_step(step_id, clean)
         return _ok(step.model_dump(mode="json"))
-    except (RatchetCatalogError, RatchetStoreError, ValueError) as exc:
+    except (
+        RatchetCatalogError,
+        RatchetStoreError,
+        ValueError,
+    ) as exc:
         return _err(exc)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error in edit_step")
+        logger.exception("Error in edit_step")
         return _err(exc)
 
 
 @tool(
     "remove_step",
-    "Delete a PENDING or FAILED step from the plan.",
+    "Delete a PENDING or FAILED step.",
     _REMOVE_STEP_SCHEMA,
 )
-async def _remove_step_handler(args: dict[str, Any]) -> dict[str, Any]:
+async def _remove_step_handler(
+    args: dict[str, Any],
+) -> dict[str, Any]:
     """Handle remove_step tool calls."""
     try:
         store = _get_plan_store()
-        step_id: str = args["step_id"]
-        await store.remove_step(step_id)
-        return _ok({"removed": step_id})
-    except (RatchetCatalogError, RatchetStoreError) as exc:
+        sid: str = args["step_id"]
+        await store.remove_step(sid)
+        return _ok({"removed": sid})
+    except (
+        RatchetCatalogError,
+        RatchetStoreError,
+    ) as exc:
         return _err(exc)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error in remove_step")
+        logger.exception("Error in remove_step")
         return _err(exc)
 
 
 @tool(
     "insert_step_after",
-    "Insert a new step immediately after the anchor step.",
+    "Insert a step after the anchor.",
     _INSERT_STEP_AFTER_SCHEMA,
 )
-async def _insert_step_after_handler(args: dict[str, Any]) -> dict[str, Any]:
+async def _insert_step_after_handler(
+    args: dict[str, Any],
+) -> dict[str, Any]:
     """Handle insert_step_after tool calls."""
     try:
         store = _get_plan_store()
         anchor_id: str = args["anchor_id"]
-        step_type: str = args["step_type"]
+        stype: str = args["step_type"]
         step_args: dict[str, Any] = args["step_args"]
-
-        full_args = {"step_type": step_type, **step_args}
+        full_args = {
+            "step_type": stype, **step_args,
+        }
         step = _build_step_from_args(full_args)
         await store.insert_step_after(anchor_id, step)
         return _ok(step.model_dump(mode="json"))
-    except (RatchetCatalogError, RatchetStoreError, ValueError) as exc:
+    except (
+        RatchetCatalogError,
+        RatchetStoreError,
+        ValueError,
+    ) as exc:
         return _err(exc)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error in insert_step_after")
+        logger.exception("Error in insert_step_after")
         return _err(exc)
 
 
 @tool(
     "view_plan",
-    "Return the current plan (steps, statuses, outputs, verdicts).",
+    "Return the current plan state.",
     _VIEW_PLAN_SCHEMA,
 )
-async def _view_plan_handler(args: dict[str, Any]) -> dict[str, Any]:
+async def _view_plan_handler(
+    args: dict[str, Any],
+) -> dict[str, Any]:
     """Handle view_plan tool calls."""
     try:
         store = _get_plan_store()
         snapshot = await store.view()
         return _ok(snapshot)
-    except (RatchetCatalogError, RatchetStoreError) as exc:
+    except (
+        RatchetCatalogError,
+        RatchetStoreError,
+    ) as exc:
         return _err(exc)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error in view_plan")
+        logger.exception("Error in view_plan")
         return _err(exc)
 
 
 @tool(
     "submit_plan",
-    "Mark the plan as submitted. Required before any step execution.",
+    "Mark the plan as submitted.",
     _SUBMIT_PLAN_SCHEMA,
 )
-async def _submit_plan_handler(args: dict[str, Any]) -> dict[str, Any]:
+async def _submit_plan_handler(
+    args: dict[str, Any],
+) -> dict[str, Any]:
     """Handle submit_plan tool calls."""
     try:
         store = _get_plan_store()
         rationale: str = args["rationale"]
         await store.submit(rationale)
-        return _ok({"submitted": True, "rationale": rationale})
-    except (RatchetCatalogError, RatchetStoreError) as exc:
+        return _ok({
+            "submitted": True,
+            "rationale": rationale,
+        })
+    except (
+        RatchetCatalogError,
+        RatchetStoreError,
+    ) as exc:
         return _err(exc)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error in submit_plan")
+        logger.exception("Error in submit_plan")
+        return _err(exc)
+
+
+# ---------------------------------------------------------------------------
+# Step execution tool
+# ---------------------------------------------------------------------------
+
+
+@tool(
+    "step",
+    "Execute the next runnable step, "
+    "or a specific step_id.",
+    _STEP_SCHEMA,
+)
+async def _step_handler(
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    """Handle step execution tool calls.
+
+    Implements the step tool body from the spec:
+      1. Resolve target step.
+      2. Check prerequisites.
+      3. Mark in progress.
+      4. Execute via executor.
+      5. Validate via validator.
+      6. Mark completed/failed.
+      7. Return verdict JSON to planner.
+    """
+    try:
+        store = _get_plan_store()
+        state = _get_state()
+        cfg = _get_config()
+        rp = _get_repo_path()
+
+        # 1. Resolve step_id
+        step_id: str | None = (
+            args.get("step_id") or None
+        )
+        if step_id is None:
+            step_id = await store.next_runnable_id()
+        if step_id is None:
+            return _ok({
+                "status": "no_runnable_step",
+                "message": (
+                    "No runnable step available."
+                ),
+            })
+
+        step = await store.get_step(step_id)
+
+        # 2. Check prerequisites
+        prereq_errors = await check_prerequisites(
+            step, store, rp,
+        )
+        if prereq_errors:
+            return _err(
+                PrerequisitesNotMetError(
+                    "Prerequisites not met: "
+                    + "; ".join(prereq_errors)
+                )
+            )
+
+        # 3. Mark in progress
+        await store.mark_in_progress(step_id)
+
+        # 4. Execute (lazy imports to avoid
+        #    circular deps at module load)
+        from ratchet.exec.executor import (  # noqa: PLC0415
+            execute_step,
+        )
+        from ratchet.exec.validator import (  # noqa: PLC0415
+            validate,
+        )
+
+        prev_ctx: str = args.get(
+            "prev_context", "",
+        )
+
+        result = await execute_step(
+            step=step,
+            cfg=cfg,
+            repo_path=rp,
+            state=state,
+            restrictions="",
+            prev_context=prev_ctx,
+        )
+
+        # 5. Validate
+        verdict = await validate(
+            step=step,
+            result=result,
+            cfg=cfg,
+            repo_path=rp,
+        )
+
+        # 6. Mark completed/failed
+        if result.success and verdict.passed:
+            output = result.output or StepOutput(
+                summary="Step completed",
+            )
+            await store.mark_completed(
+                step_id, output, verdict,
+            )
+            state.record(step_id, output)
+        else:
+            await store.mark_failed(step_id, verdict)
+
+        logger.info(
+            "Step %s: success=%s verdict=%s",
+            step_id,
+            result.success,
+            verdict.passed,
+        )
+
+        # 7. Return verdict JSON
+        return _ok({
+            "step_id": step_id,
+            "status": (
+                "completed"
+                if verdict.passed
+                else "failed"
+            ),
+            "output": (
+                result.output.model_dump(
+                    mode="json",
+                )
+                if result.output
+                else None
+            ),
+            "verdict": verdict.model_dump(
+                mode="json",
+            ),
+        })
+    except (
+        RatchetCatalogError,
+        RatchetStoreError,
+    ) as exc:
+        return _err(exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Error in step")
         return _err(exc)
 
 
@@ -810,7 +1405,6 @@ async def _submit_plan_handler(args: dict[str, Any]) -> dict[str, Any]:
 # Public API
 # ---------------------------------------------------------------------------
 
-#: Names of all Task CRUD tools.
 TASK_TOOL_NAMES: list[str] = [
     "task_create",
     "task_get",
@@ -819,7 +1413,6 @@ TASK_TOOL_NAMES: list[str] = [
     "task_delete",
 ]
 
-#: Names of all Plan tools (excluding the step execution tool).
 PLAN_TOOL_NAMES: list[str] = [
     "add_discovery_step",
     "add_implement_step",
@@ -833,8 +1426,13 @@ PLAN_TOOL_NAMES: list[str] = [
     "submit_plan",
 ]
 
-#: All catalog tool names for use in ClaudeAgentOptions.allowed_tools.
-ALL_TOOL_NAMES: list[str] = TASK_TOOL_NAMES + PLAN_TOOL_NAMES
+STEP_TOOL_NAME: str = "step"
+
+ALL_TOOL_NAMES: list[str] = (
+    TASK_TOOL_NAMES
+    + PLAN_TOOL_NAMES
+    + [STEP_TOOL_NAME]
+)
 
 _ALL_HANDLERS = [
     # Task tools
@@ -854,19 +1452,25 @@ _ALL_HANDLERS = [
     _insert_step_after_handler,
     _view_plan_handler,
     _submit_plan_handler,
+    # Step execution
+    _step_handler,
 ]
 
 
 def build_catalog_server() -> McpSdkServerConfig:
-    """Build the ratchet_catalog in-process MCP server.
+    """Build the ratchet_catalog MCP server.
 
-    Registers all Task CRUD and Plan tools. Call bind_catalog_context()
-    before starting a planner session to inject the required stores.
+    Registers all Task, Plan, and step execution tools.
+    Call bind_catalog_context() before starting
+    a planner session.
 
     Returns:
-        McpSdkServerConfig for use in ClaudeAgentOptions.mcp_servers.
+        McpSdkServerConfig for use in
+        ClaudeAgentOptions.mcp_servers.
     """
-    return create_sdk_mcp_server("ratchet_catalog", tools=_ALL_HANDLERS)
+    return create_sdk_mcp_server(
+        "ratchet_catalog", tools=_ALL_HANDLERS,
+    )
 
 
 def bind_catalog_context(
@@ -874,19 +1478,22 @@ def bind_catalog_context(
     plan_store: PlanStore,
     state: State,
     repo_path: str,
+    cfg: Config,
 ) -> None:
-    """Bind ContextVars for ratchet_catalog tool handlers.
+    """Bind ContextVars for catalog tool handlers.
 
-    Must be called by the orchestrator in the same asyncio task (or a parent
-    whose context is inherited) before the planner session starts.
+    Must be called by the orchestrator before the
+    planner session starts.
 
     Args:
-        task_store: The TaskStore instance for this solve session.
-        plan_store: The PlanStore instance for this solve session.
-        state: The State instance for recording step outputs.
-        repo_path: Absolute path to the target repository.
+        task_store: TaskStore for this session.
+        plan_store: PlanStore for this session.
+        state: State for recording step outputs.
+        repo_path: Absolute path to the repo.
+        cfg: Config for this solve session.
     """
     _task_store.set(task_store)
     _plan_store.set(plan_store)
     _state.set(state)
     _repo_path.set(repo_path)
+    _config.set(cfg)

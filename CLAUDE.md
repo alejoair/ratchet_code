@@ -146,16 +146,18 @@ Returned by the validator. Levels 2-5 produce it via `output_format`; level 1 co
 
 `__main__.py` — CLI entry point. Accepts `repo_path` positional arg plus
 `--prompt TEXT` or `--prompt-file PATH`, `--model`, `--max-turns`,
-`--cost-limit`, `--config`. Calls `solve()` and emits a
-`RATCHET_METRICS:{...}` JSON line to stdout for the vexp-swe-bench harness.
+`--cost-limit`, `--config`, `--orchestrated`. Calls `solve()` and captures
+the `SolveResult` to emit a `RATCHET_METRICS:{...}` JSON line with real
+token/cost/turn data to stdout for the vexp-swe-bench harness.
 Installed as the `ratchet` console script via `pyproject.toml`.
 
-`solve.py` — `async def solve(repo_path, request, config_path, model) -> str`.
-Entry point for library callers. Builds planner options via
-`build_planner_options()`, runs a one-shot `query()` session, logs the
-`ResultMessage` (turns, cost), and returns `git diff HEAD`.
-Until the orchestrator and catalog are wired up, this is the sole execution
-path and calls the planner directly.
+`solve.py` — `async def solve(repo_path, request, config_path, model, *, orchestrated=False) -> SolveResult`.
+Entry point for library callers. Two modes: planner-only (default) runs
+a direct SDK query; orchestrated mode delegates to `run_orchestrated()`
+which uses the full pipeline with catalog MCP, executor, and validator.
+Both modes return a `SolveResult` dataclass with patch + usage metrics.
+`SolveResult` is consumed by `__main__.py` to emit `RATCHET_METRICS:{...}`
+to stdout.
 
 `plan/planner.py` — `build_planner_options(repo_path, model) -> ClaudeAgentOptions`.
 Configures the planner session: full Claude Code toolset (`PLANNER_TOOLS`),
@@ -168,39 +170,41 @@ Configures the planner session: full Claude Code toolset (`PLANNER_TOOLS`),
 
 `state.py` — `State` class. Holds logical outputs (StepOutput) indexed by step_id. No asyncio lock needed (single-writer: plan_executor). **Implemented**: record(), resolve(), get().
 
-`config.py` — `Config` and sub-models. Loads from `ratchet.config.json`. Provides `executor_model_for(step_type)` and `validator_model_for(level)`.
+`config.py` — `Config` and sub-models (`ExecutorModels`, `ValidationConfig`, `BudgetConfig`, `HooksConfig`). Loads from `ratchet.config.json` via `Config.load(path)`. Provides `executor_model_for(step_type)` and `validator_model_for(level)` with fallback defaults. **Implemented**: all models, load(), executor_model_for(), validator_model_for(), max_validator_turns().
 
 `claude_md.py` — `parse_claude_md(repo_path) -> ClaudeMd`. Parses the three required sections (file_tree, architecture, restrictions). Raises `ValueError` if any section is missing.
 
-`plan/catalog.py` — in-process MCP server (`ratchet_catalog`) with all custom tools: Task CRUD, Plan CRUD (add_*_step, edit_step, remove_step, insert_step_after, view_plan, submit_plan), and the `step` execution tool. All tools access state via `ContextVar`. Contains `check_prerequisites`. **Implemented**: 5 Task tools (task_create, task_get, task_list, task_update, task_delete) and 10 Plan tools (add_discovery_step, add_implement_step, add_simple_task_step, add_verify_step, add_update_docs_step, edit_step, remove_step, insert_step_after, view_plan, submit_plan). ContextVars for _task_store, _plan_store, _state, _repo_path. `bind_catalog_context(task_store, plan_store, state, repo_path)`. **Not yet**: the `step` execution tool, `check_prerequisites`, `_config` ContextVar.
+`plan/catalog.py` — in-process MCP server (`ratchet_catalog`) with all custom tools: Task CRUD, Plan CRUD, and the `step` execution tool. All tools access state via `ContextVar`. Contains `check_prerequisites`. **Implemented**: 5 Task tools, 10 Plan tools, `step` execution tool, `check_prerequisites`, all 5 ContextVars (`_task_store`, `_plan_store`, `_state`, `_repo_path`, `_config`). `bind_catalog_context(task_store, plan_store, state, repo_path, cfg)`.
 
-`exec/executor.py` — `execute_step(step, cfg, repo_path, state, restrictions, prev_context) -> StepResult`. Builds options with `TOOLS_BY_STEP_TYPE` sandbox, runs SDK client, captures StepOutput via `output_format`.
+`exec/executor.py` — `execute_step(step, cfg, repo_path, state, restrictions, prev_context) -> StepResult`. Builds options with `TOOLS_BY_STEP_TYPE` sandbox, runs SDK client, captures StepOutput via `output_format`. **Implemented**: render_step_prompt, TOOLS_BY_STEP_TYPE mapping, structured output capture with unwrap logic.
 
-`exec/validator.py` — `validate(step, result, cfg, repo_path) -> ValidationVerdict`. Level 1 is subprocess; levels 2-5 are SDK clients with read-only sandbox and `output_format`.
+`exec/validator.py` — `validate(step, result, cfg, repo_path) -> ValidationVerdict`. Level 1 is subprocess; levels 2-5 are SDK clients with read-only sandbox and `output_format`. **Implemented**: all 5 levels, VALIDATOR_TOOLS_BY_LEVEL, render_validator_prompt.
 
-`exec/hooks.py` — `build_hooks(cfg, step) -> list`. Returns hook list for ruff_on_edit, commit_format_check, bash_whitelist, validator_no_write.
+`exec/hooks.py` — `build_hooks(cfg, step, is_validator=False) -> list`. Returns hook list for ruff_on_edit, commit_format_check, bash_whitelist, validator_no_write. **Implemented**: all 4 hooks, is_validator guard.
 
-`exec/plan_executor.py` — not an agent. Python code that implements the `step` tool body: resolve step, check_prerequisites, mark_in_progress, execute_step, validate, mark_completed/failed, return verdict JSON.
+`exec/plan_executor.py` — `run_step(step_id, prev_context, plan_store, state, cfg, repo_path, restrictions) -> dict`. Python function that implements the `step` tool body: resolve step, check_prerequisites, mark_in_progress, execute_step, validate, mark_completed/failed, return verdict JSON. **Implemented**: full step lifecycle.
 
-`orchestrator.py` — starts the planner session as a live ClaudeSDKClient, injects the ratchet_catalog MCP server (with ContextVars bound to active PlanStore, TaskStore, State, Config, repo_path), streams messages to/from the user.
+`orchestrator.py` — starts the planner session as a live SDK client, injects the ratchet_catalog MCP server (with ContextVars bound to active PlanStore, TaskStore, State, Config, repo_path), streams messages to/from the user. **Implemented**: `run_orchestrated(repo_path, request, cfg, model) -> str`.
 
 ### Data flow
 
-#### Current (planner-only)
+#### Mode 1: planner-only (default)
 
-1. `ratchet <repo_path> --prompt ...` -> `solve(repo_path, request, model)`
+1. `ratchet <repo_path> --prompt ...` -> `solve(orchestrated=False)`
 2. `solve()` calls `build_planner_options()` and runs `query(prompt, options)`.
 3. Planner has full Claude Code toolset and edits the repo directly.
 4. On session end, `solve()` runs `git diff HEAD` and returns the patch.
 
-#### Target (full pipeline)
+#### Mode 2: orchestrated (with `--orchestrated`)
 
-1. User message -> orchestrator -> planner session (live SDK client).
-2. Planner calls Task tools to define the task, then Plan tools to build the plan.
-3. Planner calls `step(step_id?, prev_context?)` to execute each step.
-4. `step` tool body (plan_executor.py) -> executor -> validator -> updates PlanStore + State -> returns verdict JSON to planner.
-5. Planner reacts to verdict, calls more plan tools or `step` as needed.
-6. On session end, orchestrator runs `git diff` and returns the result.
+1. `ratchet <repo_path> --prompt ... --orchestrated` -> `solve(orchestrated=True)`
+2. `solve()` delegates to `run_orchestrated(repo_path, request, cfg, model)`.
+3. Orchestrator creates TaskStore, PlanStore, State, binds ContextVars, builds catalog MCP.
+4. Planner calls Task tools to define the task, then Plan tools to build the plan.
+5. Planner calls `step(step_id?, prev_context?)` to execute each step.
+6. `step` tool body -> check_prerequisites -> executor -> validator -> mark_completed/failed -> returns verdict JSON to planner.
+7. Planner reacts to verdict, calls more plan tools or `step` as needed.
+8. On session end, orchestrator runs `git diff` and returns the result.
 
 ### Implementation status
 
@@ -209,17 +213,19 @@ Configures the planner session: full Claude Code toolset (`PLANNER_TOOLS`),
 | `plan/schema.py` | Done | All models: Task, TaskDescription, TaskStatus, TaskCategory, Step, StepType, StepIntent, ValidatorSpec, StepOutput, StepResult, ValidationVerdict |
 | `plan/store.py` | Done | TaskStore + PlanStore with all mutation rules from spec |
 | `state.py` | Done | State with record(), resolve(), get() |
-| `plan/catalog.py` | Partial | Task CRUD + Plan CRUD tools done. Missing: `step` execution tool, `check_prerequisites`, `_config` ContextVar |
+| `plan/catalog.py` | Done | 5 Task tools + 10 Plan tools + step execution tool + check_prerequisites + _config ContextVar |
 | `plan/planner.py` | Done | build_planner_options() |
-| `config.py` | Stub | Needs implementation |
-| `claude_md.py` | Stub | Needs implementation |
-| `__main__.py` | Stub | Needs implementation |
-| `solve.py` | Stub | Needs implementation |
-| `exec/executor.py` | Empty | Needs implementation |
-| `exec/validator.py` | Empty | Needs implementation |
-| `exec/hooks.py` | Empty | Needs implementation |
-| `exec/plan_executor.py` | Empty | Needs implementation |
-| `orchestrator.py` | Empty | Needs implementation |
+| `config.py` | Done | Config, ExecutorModels, ValidationConfig, BudgetConfig, HooksConfig. Load from JSON, executor_model_for(), validator_model_for(), max_validator_turns() |
+| `__main__.py` | Done | CLI with --prompt/--prompt-file/--model/--max-turns/--cost-limit/--config/--orchestrated. Emits RATCHET_METRICS |
+| `solve.py` | Done | Two modes: planner-only and orchestrated. SolveResult with patch + metrics |
+| `claude_md.py` | Done | Parse CLAUDE.md sections (file_tree, architecture, restrictions) |
+| `exec/executor.py` | Done | TOOLS_BY_STEP_TYPE sandbox, render_step_prompt, structured output capture |
+| `exec/validator.py` | Done | All 5 levels (subprocess + SDK client), VALIDATOR_TOOLS_BY_LEVEL |
+| `exec/hooks.py` | Done | ruff_on_edit, commit_format_check, bash_whitelist, validator_no_write |
+| `exec/plan_executor.py` | Done | run_step() with full lifecycle: resolve, check, execute, validate, update |
+| `orchestrator.py` | Done | run_orchestrated() with catalog MCP injection and ContextVar binding |
+
+All modules implemented. The MVP is complete.
 
 ### ContextVar bindings
 
@@ -250,16 +256,27 @@ to achieve equivalent auto-approval behavior.
 The harness adapter lives in the cloned `vexp-swe-bench` repo at
 `src/agents/ratchet.ts`. It spawns `ratchet <repo_path> --prompt-file <tmp>`
 and parses the `RATCHET_METRICS:` line from stdout. Registered in
-`src/agents/registry.ts` as `"ratchet"`.
+`src/agents/registry.ts` as `"ratchet"`. Includes cross-platform kill
+signal handling (Windows compatibility).
 
 To run a benchmark subset:
 ```bash
-# Install ratchet in a Python 3.12 venv
+# Install ratchet (Windows)
+pip install -e C:\Users\user\Desktop\ratchet_code
+
+# Dry run (verify adapter loads and instances match)
+cd C:\Users\user\Desktop\vexp-swe-bench
+node dist/cli.js run --agent ratchet --dry-run --no-vexp
+
+# Run one instance
+node dist/cli.js run --agent ratchet --instances astropy__astropy-14365 --no-vexp
+
+# Run multiple instances
+node dist/cli.js run --agent ratchet --instances id1,id2,id3 --no-vexp
+
+# Linux/Docker
 python3.12 -m venv /opt/ratchet-venv
 /opt/ratchet-venv/bin/pip install -e .
-ln -sf /opt/ratchet-venv/bin/ratchet /usr/local/bin/ratchet
-
-# Run 3 instances
 cd vexp-swe-bench
 node dist/cli.js run --agent ratchet --instances id1,id2,id3 --no-vexp
 ```
@@ -294,8 +311,8 @@ node dist/cli.js run --agent ratchet --instances id1,id2,id3 --no-vexp
 - **Home**: `C:\Users\user`
 - **Shell**: `C:\WINDOWS\system32\cmd.exe`
 - **Python**: `3.14.2` → `C:\Python314\python.exe`
-- **Date/Time**: 2026-05-02 10:42:52 (SA Pacific Standard Time)
-- **Unix Timestamp**: `1777736572`
+- **Date/Time**: 2026-05-02 17:14:04 (SA Pacific Standard Time)
+- **Unix Timestamp**: `1777760044`
 
 
 
@@ -343,34 +360,43 @@ ratchet_code/
 ├── CLAUDE.md
 ├── npm
 ├── pyproject.toml
-└── ratchet.config.json
+├── ratchet.config.json
+├── test_sdk.py
+└── test_solve.py
 ```
 
 ### Project Stats
 
-- **Python files**: 18
+- **Python files**: 20
 - **JS/TS files**: 0
-- **Total tracked files**: 18
+- **Total tracked files**: 20
 
 ### Git Info
 
 - **Branch**: `claude/download-claude-md-HTScD`
+  - f3c71cd feat(solve): return structured SolveResult with token/cost metrics
+  - 12149ff feat(plan): add Step models, PlanStore, Plan CRUD tools, and State
   - 4fc4d79 feat(catalog): implement Task CRUD tools in ratchet_catalog MCP server
-  - df617e1 docs(claude-md): update to reflect current implementation state
-  - 15e1233 fix(planner): use acceptEdits permission mode instead of bypassPermissions
 
 ### Git Status
 
 ```
   M CLAUDE.md
+   M ratchet.config.json
    M src/ratchet/__main__.py
+   M src/ratchet/claude_md.py
+   M src/ratchet/config.py
+   M src/ratchet/exec/executor.py
+   M src/ratchet/exec/hooks.py
+   M src/ratchet/exec/plan_executor.py
+   M src/ratchet/exec/validator.py
+   M src/ratchet/orchestrator.py
    M src/ratchet/plan/catalog.py
-   M src/ratchet/plan/schema.py
-   M src/ratchet/plan/store.py
    M src/ratchet/solve.py
-   M src/ratchet/state.py
   ?? =2.0
   ?? npm
+  ?? test_sdk.py
+  ?? test_solve.py
 ```
 
 ---

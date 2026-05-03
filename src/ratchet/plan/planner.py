@@ -1,41 +1,49 @@
 """Planner session configuration for the ratchet orchestrator.
 
-The planner is a Claude SDK client that receives the task description and
-operates with the full Claude Code toolset and bypass permission mode.
-The orchestrator owns the session lifecycle; this module only builds options.
+The planner is a Claude SDK client that receives the task description,
+creates a plan using catalog tools, and delegates execution to the
+step() tool. The planner only has read-only access to the repo --
+all writes happen through the executor launched by step().
 """
 
 from claude_agent_sdk import ClaudeAgentOptions
 
-# All standard Claude Code tools — no restrictions at the planner level.
-# The planner needs full read/write/execute access to work on the repo.
+# Read-only Claude Code tools. The planner can explore the repo
+# but cannot modify it directly. All modifications must go through
+# step() which launches a separate executor with write access.
 PLANNER_TOOLS: list[str] = [
-    "Bash",
-    "Edit",
     "Glob",
     "Grep",
     "LS",
-    "MultiEdit",
-    "NotebookEdit",
-    "NotebookRead",
     "Read",
-    "TodoRead",
-    "TodoWrite",
-    "WebFetch",
-    "WebSearch",
-    "Write",
 ]
 
 _SYSTEM_PROMPT = """\
 You are an autonomous software engineer working inside a Git repository.
 Your goal is to fix the issue described in the task.
 
+You have access to planning tools that let you define the task, create
+a step-by-step plan, and execute steps one at a time. You CANNOT edit
+files directly -- you must use the step() tool to execute each step,
+which launches a separate executor agent with write access.
+
+Workflow:
+1. Use task_create to define the task.
+2. Read the relevant source files to understand the codebase.
+3. Use add_*_step tools to build a plan with clear goals and briefings.
+4. Use submit_plan to lock the plan.
+5. Use step() to execute each step sequentially.
+6. Review the verdict after each step and adjust if needed.
+
 Guidelines:
-- Read the relevant source files before making changes.
+- Read the relevant source files BEFORE creating the plan.
 - Make the minimal set of changes required to fix the issue.
-- Do NOT modify test files unless the issue explicitly requires it.
+- Do NOT modify test files unless the issue requires it.
 - Do NOT add unrelated refactors, comments, or formatting changes.
-- After making changes, verify they are correct by re-reading the modified files.
+- Each step briefing must be self-contained: include file paths,
+  line numbers, and exact instructions for the executor.
+- The executor has NO memory between steps -- include all context
+  the executor needs in the step briefing.
 """
 
 
@@ -47,8 +55,8 @@ def build_planner_options(repo_path: str, model: str) -> ClaudeAgentOptions:
         model: Claude model ID to use for the planner.
 
     Returns:
-        ClaudeAgentOptions configured with all Claude Code tools,
-        bypass permission mode, and project-level settings.
+        ClaudeAgentOptions configured with read-only Claude Code
+        tools, catalog MCP tools, and project-level settings.
     """
     return ClaudeAgentOptions(
         model=model,

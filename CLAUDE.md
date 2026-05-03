@@ -145,24 +145,26 @@ Returned by the validator. Levels 2-5 produce it via `output_format`; level 1 co
 ### Module responsibilities
 
 `__main__.py` — CLI entry point. Accepts `repo_path` positional arg plus
-`--prompt TEXT` or `--prompt-file PATH`, `--model`, `--max-turns`,
-`--cost-limit`, `--config`, `--orchestrated`. Calls `solve()` and captures
-the `SolveResult` to emit a `RATCHET_METRICS:{...}` JSON line with real
-token/cost/turn data to stdout for the vexp-swe-bench harness.
-Installed as the `ratchet` console script via `pyproject.toml`.
+`--prompt TEXT` or `--prompt-file PATH`, `--model`, `--config`.
+Calls `solve()` and captures the `SolveResult` to emit a
+`RATCHET_METRICS:{...}` JSON line with real token/cost/turn data to stdout
+for the vexp-swe-bench harness. Also writes a `.ratchet.log` file (all
+session logging) and a `.ratchet_plan.json` file (plan trace) next to the
+repo directory. Installed as the `ratchet` console script via
+`pyproject.toml`.
 
-`solve.py` — `async def solve(repo_path, request, config_path, model, *, orchestrated=False) -> SolveResult`.
-Entry point for library callers. Two modes: planner-only (default) runs
-a direct SDK query; orchestrated mode delegates to `run_orchestrated()`
-which uses the full pipeline with catalog MCP, executor, and validator.
-Both modes return a `SolveResult` dataclass with patch + usage metrics.
-`SolveResult` is consumed by `__main__.py` to emit `RATCHET_METRICS:{...}`
-to stdout.
+`solve.py` — `async def solve(repo_path, request, config_path, model) -> SolveResult`.
+Entry point for library callers. Loads config (or builds a default),
+delegates to `run_orchestrated()` which uses the full pipeline with
+catalog MCP, executor, and validator. Returns a `SolveResult` dataclass
+with patch + usage metrics. `SolveResult` is consumed by `__main__.py`
+to emit `RATCHET_METRICS:{...}` to stdout.
 
-`plan/planner.py` — `build_planner_options(repo_path, model) -> ClaudeAgentOptions`.
-Configures the planner session: full Claude Code toolset (`PLANNER_TOOLS`),
-`permission_mode="acceptEdits"`, `allowed_tools=PLANNER_TOOLS`,
-`setting_sources=["user", "project", "local"]`. Does not run the session.
+`plan/planner.py` — Defines `PLANNER_TOOLS` (read-only: Glob, Grep, LS,
+Read) and `build_planner_options(repo_path, model) -> ClaudeAgentOptions`.
+The orchestrator builds its own options combining `PLANNER_TOOLS` with
+prefixed MCP catalog tool names; `build_planner_options()` is available
+for standalone planner sessions without catalog MCP.
 
 `plan/schema.py` — all Pydantic models. No I/O, no side effects. Pure data definitions.
 
@@ -174,37 +176,30 @@ Configures the planner session: full Claude Code toolset (`PLANNER_TOOLS`),
 
 `claude_md.py` — `parse_claude_md(repo_path) -> ClaudeMd`. Parses the three required sections (file_tree, architecture, restrictions). Raises `ValueError` if any section is missing.
 
-`plan/catalog.py` — in-process MCP server (`ratchet_catalog`) with all custom tools: Task CRUD, Plan CRUD, and the `step` execution tool. All tools access state via `ContextVar`. Contains `check_prerequisites`. **Implemented**: 5 Task tools, 10 Plan tools, `step` execution tool, `check_prerequisites`, all 5 ContextVars (`_task_store`, `_plan_store`, `_state`, `_repo_path`, `_config`). `bind_catalog_context(task_store, plan_store, state, repo_path, cfg)`.
+`plan/catalog.py` — in-process MCP server (`ratchet_catalog`) with all custom tools: Task CRUD, Plan CRUD, and the `step` execution tool. All tools access state via `ContextVar`. Contains `check_prerequisites`. **Implemented**: 5 Task tools, 10 Plan tools, `step` execution tool, `check_prerequisites`, all 5 ContextVars (`_task_store`, `_plan_store`, `_state`, `_repo_path`, `_config`). `bind_catalog_context(task_store, plan_store, state, repo_path, cfg)`. Tool names are registered without prefix (e.g. `task_create`); the orchestrator prefixes them with `mcp__ratchet_catalog__` for the CLI.
 
-`exec/executor.py` — `execute_step(step, cfg, repo_path, state, restrictions, prev_context) -> StepResult`. Builds options with `TOOLS_BY_STEP_TYPE` sandbox, runs SDK client, captures StepOutput via `output_format`. **Implemented**: render_step_prompt, TOOLS_BY_STEP_TYPE mapping, structured output capture with unwrap logic.
+`exec/executor.py` — `execute_step(step, cfg, repo_path, state, restrictions, prev_context) -> StepResult`. Builds options with `TOOLS_BY_STEP_TYPE` sandbox, runs SDK client, captures StepOutput via text-based JSON parsing. **Implemented**: render_step_prompt, TOOLS_BY_STEP_TYPE mapping, structured output capture with regex-based JSON extraction.
 
-`exec/validator.py` — `validate(step, result, cfg, repo_path) -> ValidationVerdict`. Level 1 is subprocess; levels 2-5 are SDK clients with read-only sandbox and `output_format`. **Implemented**: all 5 levels, VALIDATOR_TOOLS_BY_LEVEL, render_validator_prompt.
+`exec/validator.py` — `validate(step, result, cfg, repo_path) -> ValidationVerdict`. Level 1 is subprocess; levels 2-5 are SDK clients with read-only sandbox. **Implemented**: all 5 levels, VALIDATOR_TOOLS_BY_LEVEL, render_validator_prompt. Currently returns a "no model configured" verdict for levels 2-5 when no validator model is set in config.
 
 `exec/hooks.py` — `build_hooks(cfg, step, is_validator=False) -> list`. Returns hook list for ruff_on_edit, commit_format_check, bash_whitelist, validator_no_write. **Implemented**: all 4 hooks, is_validator guard.
 
 `exec/plan_executor.py` — `run_step(step_id, prev_context, plan_store, state, cfg, repo_path, restrictions) -> dict`. Python function that implements the `step` tool body: resolve step, check_prerequisites, mark_in_progress, execute_step, validate, mark_completed/failed, return verdict JSON. **Implemented**: full step lifecycle.
 
-`orchestrator.py` — starts the planner session as a live SDK client, injects the ratchet_catalog MCP server (with ContextVars bound to active PlanStore, TaskStore, State, Config, repo_path), streams messages to/from the user. **Implemented**: `run_orchestrated(repo_path, request, cfg, model) -> str`.
+`orchestrator.py` — starts the planner session as a live SDK client, injects the ratchet_catalog MCP server (with ContextVars bound to active PlanStore, TaskStore, State, Config, repo_path), streams messages to/from the user. Prefixes MCP tool names with `mcp__ratchet_catalog__` in `tools` and `allowed_tools` so the CLI recognizes and auto-approves them. Logs planner activity at INFO level. **Implemented**: `run_orchestrated(repo_path, request, cfg, model) -> SolveResult`.
 
 ### Data flow
 
-#### Mode 1: planner-only (default)
-
-1. `ratchet <repo_path> --prompt ...` -> `solve(orchestrated=False)`
-2. `solve()` calls `build_planner_options()` and runs `query(prompt, options)`.
-3. Planner has full Claude Code toolset and edits the repo directly.
-4. On session end, `solve()` runs `git diff HEAD` and returns the patch.
-
-#### Mode 2: orchestrated (with `--orchestrated`)
-
-1. `ratchet <repo_path> --prompt ... --orchestrated` -> `solve(orchestrated=True)`
-2. `solve()` delegates to `run_orchestrated(repo_path, request, cfg, model)`.
+1. `ratchet <repo_path> --prompt ...` -> `solve(repo_path, request, config_path, model)`
+2. `solve()` loads config (or builds default), delegates to `run_orchestrated()`.
 3. Orchestrator creates TaskStore, PlanStore, State, binds ContextVars, builds catalog MCP.
-4. Planner calls Task tools to define the task, then Plan tools to build the plan.
-5. Planner calls `step(step_id?, prev_context?)` to execute each step.
-6. `step` tool body -> check_prerequisites -> executor -> validator -> mark_completed/failed -> returns verdict JSON to planner.
-7. Planner reacts to verdict, calls more plan tools or `step` as needed.
-8. On session end, orchestrator runs `git diff` and returns the result.
+4. Planner has read-only tools (Glob, Grep, LS, Read) plus prefixed MCP catalog tools.
+5. Planner calls Task tools to define the task, then Plan tools to build the plan.
+6. Planner calls `step(step_id?, prev_context?)` to execute each step.
+7. `step` tool body -> check_prerequisites -> executor -> validator -> mark_completed/failed -> returns verdict JSON to planner.
+8. Planner reacts to verdict, calls more plan tools or `step` as needed.
+9. On session end, orchestrator runs `git diff` and returns the result.
+10. `__main__.py` emits `RATCHET_METRICS:{...}` to stdout and writes `.ratchet_plan.json` and `.ratchet.log`.
 
 ### Implementation status
 
@@ -213,19 +208,19 @@ Configures the planner session: full Claude Code toolset (`PLANNER_TOOLS`),
 | `plan/schema.py` | Done | All models: Task, TaskDescription, TaskStatus, TaskCategory, Step, StepType, StepIntent, ValidatorSpec, StepOutput, StepResult, ValidationVerdict |
 | `plan/store.py` | Done | TaskStore + PlanStore with all mutation rules from spec |
 | `state.py` | Done | State with record(), resolve(), get() |
-| `plan/catalog.py` | Done | 5 Task tools + 10 Plan tools + step execution tool + check_prerequisites + _config ContextVar |
-| `plan/planner.py` | Done | build_planner_options() |
+| `plan/catalog.py` | Done | 5 Task tools + 10 Plan tools + step execution tool + check_prerequisites + 5 ContextVars |
+| `plan/planner.py` | Done | PLANNER_TOOLS (read-only), build_planner_options() |
 | `config.py` | Done | Config, ExecutorModels, ValidationConfig, BudgetConfig, HooksConfig. Load from JSON, executor_model_for(), validator_model_for(), max_validator_turns() |
-| `__main__.py` | Done | CLI with --prompt/--prompt-file/--model/--max-turns/--cost-limit/--config/--orchestrated. Emits RATCHET_METRICS |
-| `solve.py` | Done | Two modes: planner-only and orchestrated. SolveResult with patch + metrics |
+| `__main__.py` | Done | CLI with --prompt/--prompt-file/--model/--config. File logging (.ratchet.log) + plan trace (.ratchet_plan.json) |
+| `solve.py` | Done | Single mode: orchestrated via run_orchestrated(). SolveResult with patch + metrics |
 | `claude_md.py` | Done | Parse CLAUDE.md sections (file_tree, architecture, restrictions) |
-| `exec/executor.py` | Done | TOOLS_BY_STEP_TYPE sandbox, render_step_prompt, structured output capture |
-| `exec/validator.py` | Done | All 5 levels (subprocess + SDK client), VALIDATOR_TOOLS_BY_LEVEL |
+| `exec/executor.py` | Done | TOOLS_BY_STEP_TYPE sandbox, render_step_prompt, text-based JSON output capture |
+| `exec/validator.py` | Done | All 5 levels (subprocess + SDK client). Levels 2-5 need validator model in config |
 | `exec/hooks.py` | Done | ruff_on_edit, commit_format_check, bash_whitelist, validator_no_write |
 | `exec/plan_executor.py` | Done | run_step() with full lifecycle: resolve, check, execute, validate, update |
-| `orchestrator.py` | Done | run_orchestrated() with catalog MCP injection and ContextVar binding |
+| `orchestrator.py` | Done | run_orchestrated() with catalog MCP injection, ContextVar binding, MCP tool name prefixing |
 
-All modules implemented. The MVP is complete.
+All modules implemented. The MVP is complete and verified end-to-end on SWE-bench instances.
 
 ### ContextVar bindings
 
@@ -251,6 +246,13 @@ Always set both to the same list. Never rely on `disallowed_tools` alone to sand
 running as root. Use `"acceptEdits"` combined with a full `allowed_tools` list
 to achieve equivalent auto-approval behavior.
 
+**MCP tool name prefixing**: The CLI prefixes MCP tool names as
+`mcp__<server_name>__<tool_name>`. Both `tools` and `allowed_tools` must
+use these prefixed names (e.g. `mcp__ratchet_catalog__task_create`) for the
+CLI to recognize and auto-approve them. The catalog server itself registers
+tools without the prefix (e.g. `task_create`); the orchestrator adds the
+prefix when building `ClaudeAgentOptions`.
+
 ### vexp-swe-bench integration
 
 The harness adapter lives in the cloned `vexp-swe-bench` repo at
@@ -269,7 +271,7 @@ cd C:\Users\user\Desktop\vexp-swe-bench
 node dist/cli.js run --agent ratchet --dry-run --no-vexp
 
 # Run one instance
-node dist/cli.js run --agent ratchet --instances astropy__astropy-14365 --no-vexp
+node dist/cli.js run --agent ratchet --instances django__django-11133 --no-vexp
 
 # Run multiple instances
 node dist/cli.js run --agent ratchet --instances id1,id2,id3 --no-vexp
@@ -311,8 +313,8 @@ node dist/cli.js run --agent ratchet --instances id1,id2,id3 --no-vexp
 - **Home**: `C:\Users\user`
 - **Shell**: `C:\WINDOWS\system32\cmd.exe`
 - **Python**: `3.14.2` → `C:\Python314\python.exe`
-- **Date/Time**: 2026-05-02 17:14:04 (SA Pacific Standard Time)
-- **Unix Timestamp**: `1777760044`
+- **Date/Time**: 2026-05-03 10:44:33 (SA Pacific Standard Time)
+- **Unix Timestamp**: `1777823073`
 
 
 
@@ -332,6 +334,9 @@ node dist/cli.js run --agent ratchet --instances id1,id2,id3 --no-vexp
 
 ```
 ratchet_code/
+├── bench_results/
+│   ├── astropy-14369.jsonl
+│   └── evaluation.md
 ├── examples/
 │   └── swebench_adapter.py
 ├── src/
@@ -357,44 +362,44 @@ ratchet_code/
 │       └── state.py
 ├── .gitignore
 ├── =2.0
+├── bench_rubric.md
 ├── CLAUDE.md
 ├── npm
 ├── pyproject.toml
 ├── ratchet.config.json
+├── test_orchestrated.py
+├── test_prompt.txt
 ├── test_sdk.py
 └── test_solve.py
 ```
 
 ### Project Stats
 
-- **Python files**: 20
+- **Python files**: 21
 - **JS/TS files**: 0
-- **Total tracked files**: 20
+- **Total tracked files**: 21
 
 ### Git Info
 
 - **Branch**: `claude/download-claude-md-HTScD`
+  - 99b6e3a fix(exec): replace output_format with text-based JSON parsing for SDK compat
+  - f78a530 feat: complete MVP with orchestrated pipeline, config, executor, validator, and hooks
   - f3c71cd feat(solve): return structured SolveResult with token/cost metrics
-  - 12149ff feat(plan): add Step models, PlanStore, Plan CRUD tools, and State
-  - 4fc4d79 feat(catalog): implement Task CRUD tools in ratchet_catalog MCP server
 
 ### Git Status
 
 ```
   M CLAUDE.md
-   M ratchet.config.json
    M src/ratchet/__main__.py
-   M src/ratchet/claude_md.py
-   M src/ratchet/config.py
-   M src/ratchet/exec/executor.py
-   M src/ratchet/exec/hooks.py
-   M src/ratchet/exec/plan_executor.py
-   M src/ratchet/exec/validator.py
    M src/ratchet/orchestrator.py
-   M src/ratchet/plan/catalog.py
+   M src/ratchet/plan/planner.py
    M src/ratchet/solve.py
   ?? =2.0
+  ?? bench_results/
+  ?? bench_rubric.md
   ?? npm
+  ?? test_orchestrated.py
+  ?? test_prompt.txt
   ?? test_sdk.py
   ?? test_solve.py
 ```

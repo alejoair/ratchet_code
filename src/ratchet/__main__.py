@@ -65,16 +65,6 @@ def _build_parser() -> argparse.ArgumentParser:
             "(default: <repo_path>/ratchet.config.json)"
         ),
     )
-    parser.add_argument(
-        "--orchestrated",
-        action="store_true",
-        default=False,
-        dest="orchestrated",
-        help=(
-            "Use full pipeline with catalog MCP, "
-            "executor, and validator"
-        ),
-    )
     return parser
 
 
@@ -84,10 +74,25 @@ def main() -> None:
     Runs the solver and prints a RATCHET_METRICS JSON line to stdout so the
     vexp-swe-bench harness can capture token usage and cost.
     """
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
-
     parser = _build_parser()
     args = parser.parse_args()
+
+    # Log to stderr and a file next to the repo for debugging.
+    log_path = args.repo_path.rstrip("/\\") + ".ratchet.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+    )
+    file_handler = logging.FileHandler(
+        log_path, encoding="utf-8", mode="w",
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(name)s %(levelname)s %(message)s",
+        ),
+    )
+    logging.getLogger().addHandler(file_handler)
 
     if args.prompt_file:
         try:
@@ -111,6 +116,7 @@ def main() -> None:
 
     start_ms = int(time.time() * 1000)
     exit_code = 0
+    result = None
 
     try:
         from ratchet.solve import solve  # noqa: PLC0415
@@ -123,7 +129,6 @@ def main() -> None:
                 args.repo_path,
                 prompt,
                 args.config,
-                orchestrated=args.orchestrated,
                 **kw,
             ),
         )
@@ -151,6 +156,16 @@ def main() -> None:
     print(
         f"RATCHET_METRICS:{json.dumps(metrics)}", flush=True,
     )
+
+    # Write plan trace to file next to the repo.
+    if result is not None and result.plan_trace is not None:
+        plan_path = args.repo_path.rstrip("/\\") + ".ratchet_plan.json"
+        try:
+            with open(plan_path, "w", encoding="utf-8") as pf:
+                json.dump(result.plan_trace, pf, indent=2, default=str)
+        except OSError as exc:
+            logger.warning("Could not write plan file: %s", exc)
+
     sys.exit(exit_code)
 
 

@@ -4,12 +4,19 @@ Starts the planner as a live SDK client, binds ContextVars, injects
 the ratchet_catalog MCP server, and streams messages to/from the user.
 """
 
+import json
 import logging
 import subprocess
 
 from claude_agent_sdk import (
+    AssistantMessage,
     ClaudeAgentOptions,
     ResultMessage,
+    ServerToolResultBlock,
+    ServerToolUseBlock,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
     query,
 )
 
@@ -21,30 +28,82 @@ from ratchet.plan.catalog import (
 )
 from ratchet.plan.planner import PLANNER_TOOLS
 from ratchet.plan.store import PlanStore, TaskStore
-from ratchet.solve import SolveResult, _extract_metrics
+from ratchet.solve import SolveResult
 from ratchet.state import State
 
 logger = logging.getLogger(__name__)
+
+
+def _truncate(text: str, max_len: int) -> str:
+    """Truncate text with ellipsis indicator."""
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "..."
+
+
+def _log_assistant_message(msg: AssistantMessage) -> None:
+    """Log a structured summary of an AssistantMessage to INFO."""
+    for block in msg.content:
+        if isinstance(block, TextBlock):
+            text = block.text.strip()
+            if text:
+                logger.info("[planner] %s", _truncate(text, 300))
+        elif isinstance(block, (ToolUseBlock, ServerToolUseBlock)):
+            raw_input = block.input
+            logger.info(
+                "[planner] >> %s(%s)",
+                block.name,
+                _truncate(json.dumps(raw_input, default=str), 200),
+            )
+        elif isinstance(block, ToolResultBlock):
+            content_str = _truncate(str(block.content), 200)
+            tag = "ERR" if block.is_error else "OK"
+            logger.info("[planner] << %s %s", tag, content_str)
+        elif isinstance(block, ServerToolResultBlock):
+            content_str = _truncate(json.dumps(block.content, default=str), 200)
+            logger.info("[planner] << %s", content_str)
+
+
+def _extract_metrics(
+    result: SolveResult,
+    last_msg: ResultMessage,
+) -> None:
+    """Populate metrics fields from a ResultMessage."""
+    result.num_turns = last_msg.num_turns or 0
+    result.cost_usd = last_msg.total_cost_usd or 0.0
+
+    usage = last_msg.usage or {}
+    result.input_tokens = usage.get("input_tokens", 0) or 0
+    result.output_tokens = usage.get("output_tokens", 0) or 0
+    result.cache_read_tokens = usage.get("cache_read_input_tokens", 0) or 0
+    result.cache_creation_tokens = usage.get("cache_creation_input_tokens", 0) or 0
 
 _SYSTEM_PROMPT = """\
 You are an autonomous software engineer working inside a Git repository.
 Your goal is to fix the issue described in the task.
 
 You have access to planning tools that let you define the task, create
-a step-by-step plan, and execute steps one at a time.
+a step-by-step plan, and execute steps one at a time. You CANNOT edit
+files directly -- you must use the step() tool to execute each step,
+which launches a separate executor agent with write access.
 
 Workflow:
 1. Use task_create to define the task.
-2. Use add_*_step tools to build a plan with clear goals.
-3. Use submit_plan to lock the plan.
-4. Use step() to execute each step sequentially.
-5. Review the verdict after each step and adjust if needed.
+2. Read the relevant source files to understand the codebase.
+3. Use add_*_step tools to build a plan with clear goals and briefings.
+4. Use submit_plan to lock the plan.
+5. Use step() to execute each step sequentially.
+6. Review the verdict after each step and adjust if needed.
 
 Guidelines:
-- Read the relevant source files before making changes.
+- Read the relevant source files BEFORE creating the plan.
 - Make the minimal set of changes required to fix the issue.
 - Do NOT modify test files unless the issue requires it.
 - Do NOT add unrelated refactors, comments, or formatting changes.
+- Each step briefing must be self-contained: include file paths,
+  line numbers, and exact instructions for the executor.
+- The executor has NO memory between steps -- include all context
+  the executor needs in the step briefing.
 """
 
 
@@ -84,7 +143,14 @@ async def run_orchestrated(
 
     catalog = build_catalog_server()
 
-    all_tools = PLANNER_TOOLS + ALL_TOOL_NAMES
+    # The CLI prefixes MCP tool names as mcp__<server>__<tool>.
+    # Both 'tools' and 'allowed_tools' must use the prefixed names
+    # for the CLI to recognize and auto-approve them.
+    mcp_prefix = "mcp__ratchet_catalog__"
+    prefixed_mcp_tools = [
+        mcp_prefix + name for name in ALL_TOOL_NAMES
+    ]
+    all_tools = PLANNER_TOOLS + prefixed_mcp_tools
 
     options = ClaudeAgentOptions(
         model=model,
@@ -104,10 +170,8 @@ async def run_orchestrated(
     ):
         if isinstance(message, ResultMessage):
             last_result = message
-        logger.debug(
-            "Orchestrator message: %s",
-            type(message).__name__,
-        )
+        elif isinstance(message, AssistantMessage):
+            _log_assistant_message(message)
 
     diff = subprocess.run(
         ["git", "diff", "HEAD"],
@@ -117,7 +181,10 @@ async def run_orchestrated(
         check=False,
     )
 
-    result = SolveResult(patch=diff.stdout)
+    result = SolveResult(
+        patch=diff.stdout,
+        plan_trace=await plan_store.view(),
+    )
     if last_result is not None:
         _extract_metrics(result, last_result)
         logger.info(

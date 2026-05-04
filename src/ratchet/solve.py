@@ -50,16 +50,25 @@ async def solve(
         run_orchestrated,
     )
 
-    # Load config if available
+    # Resolve config: explicit path > <repo_path>/ratchet.config.json > defaults
     cfg: Config | None = None
-    if config_path is not None:
+    resolved_path = config_path
+    if resolved_path is None:
+        from pathlib import Path  # noqa: PLC0415
+
+        candidate = Path(repo_path) / "ratchet.config.json"
+        if candidate.is_file():
+            resolved_path = str(candidate)
+            logger.info("Using config from %s", resolved_path)
+
+    if resolved_path is not None:
         try:
-            cfg = Config.load(config_path)
+            cfg = Config.load(resolved_path)
         except (FileNotFoundError, ValueError):
             logger.warning(
                 "Could not load config from %s, "
                 "using defaults",
-                config_path,
+                resolved_path,
             )
 
     if cfg is None:

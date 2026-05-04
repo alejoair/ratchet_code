@@ -15,7 +15,7 @@
     }
   },
   "validation": {
-    "default_level": 3,
+    "default_level": 1,
     "max_turns_by_level": {
       "1": 0,
       "2": 1,

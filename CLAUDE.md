@@ -311,21 +311,21 @@ node dist/cli.js run --agent ratchet --instances id1,id2,id3 --no-vexp
 - **OS**: 🪟 Windows 11 (AMD64)
 - **User**: `user@DESKTOP-92K2Q7P`
 - **Home**: `C:\Users\user`
-- **Shell**: `C:\WINDOWS\system32\cmd.exe`
+- **Shell**: `C:\Program Files\Git\usr\bin\bash.exe`
 - **Python**: `3.14.2` → `C:\Python314\python.exe`
-- **Date/Time**: 2026-05-03 10:44:33 (SA Pacific Standard Time)
-- **Unix Timestamp**: `1777823073`
+- **Date/Time**: 2026-05-04 11:54:03 (SA Pacific Standard Time)
+- **Unix Timestamp**: `1777913643`
 
 
 
 ### Extended System Info
 
 - **LANG**: `unknown`
-- **TERM**: `unknown`
+- **TERM**: `xterm`
 - **PATH**:
   ```
-  C:\Python314\Scripts\;C:\Python314\;C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;
-  ... C:\Users\user\AppData\Roaming\Python\Python314\Scripts;C:\Users\user\AppData\Local\Programs\Microsoft VS Code\bin;C:\Users\user\.lmstudio\bin
+  C:\Users\user\bin;C:\Program Files\Git\mingw64\bin;C:\Program Files\Git\usr\local\bin;C:\Program Files\Git\usr\bin;C:\Program Files\Git\usr\bin;
+  ... C:\Users\user\.lmstudio\bin;C:\Program Files\Git\usr\bin\vendor_perl;C:\Program Files\Git\usr\bin\core_perl
   ```
 
 
@@ -382,18 +382,14 @@ ratchet_code/
 ### Git Info
 
 - **Branch**: `claude/download-claude-md-HTScD`
+  - 27499c3 fix(orchestrator): prefix MCP tool names for CLI auto-approval
   - 99b6e3a fix(exec): replace output_format with text-based JSON parsing for SDK compat
   - f78a530 feat: complete MVP with orchestrated pipeline, config, executor, validator, and hooks
-  - f3c71cd feat(solve): return structured SolveResult with token/cost metrics
 
 ### Git Status
 
 ```
   M CLAUDE.md
-   M src/ratchet/__main__.py
-   M src/ratchet/orchestrator.py
-   M src/ratchet/plan/planner.py
-   M src/ratchet/solve.py
   ?? =2.0
   ?? bench_results/
   ?? bench_rubric.md

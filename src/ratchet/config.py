@@ -53,6 +53,8 @@ class ValidationConfig(BaseModel):
     Attributes:
         default_level: Default validation level when not specified.
         max_turns_by_level: Maximum LLM turns per validation level.
+        level_by_step_type: Default validation level per step type.
+            Overrides default_level when the step type has an entry.
     """
 
     default_level: Annotated[int, Field(ge=1, le=5)] = 3
@@ -62,6 +64,13 @@ class ValidationConfig(BaseModel):
         "3": 3,
         "4": 5,
         "5": 10,
+    }
+    level_by_step_type: dict[str, int] = {
+        "discovery_step": 1,
+        "implement_step": 3,
+        "simple_task_step": 2,
+        "verify_step": 1,
+        "update_docs_step": 2,
     }
 
 
@@ -106,12 +115,15 @@ class Config(BaseModel):
         validation: Default validation level and turn budgets.
         budgets: Global limits for executor and planner sessions.
         hooks: Hook configuration for code quality enforcement.
+        restrictions: Parsed restrictions from CLAUDE.md, injected
+            into executor system prompts.
     """
 
     models: dict[str, Any]
     validation: ValidationConfig = ValidationConfig()
     budgets: BudgetConfig = BudgetConfig()
     hooks: HooksConfig = HooksConfig()
+    restrictions: str = ""
 
     @classmethod
     def load(cls, path: str = _DEFAULT_CONFIG_NAME) -> "Config":
@@ -181,4 +193,21 @@ class Config(BaseModel):
         """
         return self.validation.max_turns_by_level.get(
             str(level), 0,
+        )
+
+    def default_validation_level(
+        self, step_type: StepType,
+    ) -> int:
+        """Return the default validation level for a step type.
+
+        Args:
+            step_type: The step type to look up.
+
+        Returns:
+            The configured level for the step type, or
+            the global default_level.
+        """
+        return self.validation.level_by_step_type.get(
+            step_type.value,
+            self.validation.default_level,
         )

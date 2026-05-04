@@ -313,8 +313,8 @@ node dist/cli.js run --agent ratchet --instances id1,id2,id3 --no-vexp
 - **Home**: `C:\Users\user`
 - **Shell**: `C:\Program Files\Git\usr\bin\bash.exe`
 - **Python**: `3.14.2` → `C:\Python314\python.exe`
-- **Date/Time**: 2026-05-04 11:54:03 (SA Pacific Standard Time)
-- **Unix Timestamp**: `1777913643`
+- **Date/Time**: 2026-05-04 17:47:34 (SA Pacific Standard Time)
+- **Unix Timestamp**: `1777934854`
 
 
 
@@ -382,14 +382,21 @@ ratchet_code/
 ### Git Info
 
 - **Branch**: `claude/download-claude-md-HTScD`
+  - 1b9b713 fix(solve,validator): load config from repo path and handle nested SDK errors
   - 27499c3 fix(orchestrator): prefix MCP tool names for CLI auto-approval
   - 99b6e3a fix(exec): replace output_format with text-based JSON parsing for SDK compat
-  - f78a530 feat: complete MVP with orchestrated pipeline, config, executor, validator, and hooks
 
 ### Git Status
 
 ```
   M CLAUDE.md
+   M src/ratchet/__main__.py
+   M src/ratchet/config.py
+   M src/ratchet/exec/executor.py
+   M src/ratchet/exec/validator.py
+   M src/ratchet/orchestrator.py
+   M src/ratchet/plan/catalog.py
+   M src/ratchet/solve.py
   ?? =2.0
   ?? bench_results/
   ?? bench_rubric.md

@@ -76,6 +76,17 @@ async def solve(
             models={"planner": model},
         )
 
+    # Parse CLAUDE.md restrictions and inject into config
+    try:
+        from ratchet.claude_md import (  # noqa: PLC0415
+            parse_claude_md,
+        )
+        claude_md = parse_claude_md(repo_path)
+        cfg.restrictions = claude_md.restrictions
+        logger.info("Loaded CLAUDE.md restrictions (%d chars)", len(cfg.restrictions))
+    except (FileNotFoundError, ValueError) as exc:
+        logger.info("No CLAUDE.md restrictions loaded: %s", exc)
+
     return await run_orchestrated(
         repo_path=repo_path,
         request=request,

@@ -26,7 +26,7 @@ TOOLS_BY_STEP_TYPE: dict[StepType, list[str]] = {
     StepType.DISCOVERY_STEP: ["Read", "Glob", "Grep"],
     StepType.IMPLEMENT_STEP: ["Read", "Edit", "Write"],
     StepType.SIMPLE_TASK_STEP: ["Read", "Bash"],
-    StepType.VERIFY_STEP: ["Read", "Bash"],
+    StepType.VERIFY_STEP: ["Read", "Grep", "Glob"],
     StepType.UPDATE_DOCS_STEP: ["Read", "Edit", "Write"],
 }
 
@@ -197,35 +197,38 @@ async def execute_step(
     deps = state.resolve(step.depends_on)
     prompt = render_step_prompt(step, deps, prev_context)
 
-    system_append = f"{step.briefing}\n\n"
+    system_body = f"""\
+You are a code modification agent. Your job is to make the exact changes
+described below. You MUST follow these rules strictly:
+
+RULES:
+- Only modify files listed as target files. Do NOT touch any other files.
+- Do NOT create test files, verification scripts, or documentation files.
+- Do NOT delete any existing files.
+- Do NOT add comments explaining what you changed unless specifically asked.
+- Make the minimal, surgical change needed. Do not refactor surrounding code.
+- After completing the task, you MUST end your response with a JSON block
+  wrapped in ```json ... ``` containing your output in this exact schema:
+  {{"summary": "<what you did>", "artifacts": {{}}, "notes": ""}}
+  This JSON block is mandatory.
+
+TASK BRIEFING:
+{step.briefing}
+"""
+
     if restrictions:
-        system_append += (
-            f"Project restrictions:\n{restrictions}"
+        system_body += (
+            f"\nProject restrictions:\n{restrictions}\n"
         )
 
     tools = TOOLS_BY_STEP_TYPE.get(
         step.type, ["Read"],
     )
 
-    schema_hint = (
-        "\n\nIMPORTANT: After completing the task, you MUST "
-        "end your response with a JSON block wrapped in "
-        "```json ... ``` containing your output in this "
-        "exact schema:\n"
-        '{"summary": "<what you did>", '
-        '"artifacts": {}, "notes": ""}\n'
-        "This JSON block is mandatory."
-    )
-
     options = ClaudeAgentOptions(
         model=cfg.executor_model_for(step.type),
         cwd=repo_path,
-        setting_sources=["project"],
-        system_prompt={
-            "type": "preset",
-            "preset": "claude_code",
-            "append": system_append + schema_hint,
-        },
+        system_prompt=system_body,
         tools=tools,
         allowed_tools=tools,
         max_turns=cfg.budgets.max_executor_turns,

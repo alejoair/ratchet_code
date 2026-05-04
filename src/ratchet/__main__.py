@@ -65,6 +65,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "(default: <repo_path>/ratchet.config.json)"
         ),
     )
+    parser.add_argument(
+        "--instance-id",
+        default=None,
+        dest="instance_id",
+        help="SWE-bench instance ID for per-instance log/plan files",
+    )
     return parser
 
 
@@ -78,7 +84,13 @@ def main() -> None:
     args = parser.parse_args()
 
     # Log to stderr and a file next to the repo for debugging.
-    log_path = args.repo_path.rstrip("/\\") + ".ratchet.log"
+    # Use instance_id for per-instance files when available.
+    suffix = (
+        f".{args.instance_id}" if args.instance_id else ""
+    )
+    log_path = (
+        args.repo_path.rstrip("/\\") + suffix + ".ratchet.log"
+    )
     logging.basicConfig(
         level=logging.INFO,
         stream=sys.stderr,
@@ -159,7 +171,11 @@ def main() -> None:
 
     # Write plan trace to file next to the repo.
     if result is not None and result.plan_trace is not None:
-        plan_path = args.repo_path.rstrip("/\\") + ".ratchet_plan.json"
+        plan_path = (
+            args.repo_path.rstrip("/\\")
+            + suffix
+            + ".ratchet_plan.json"
+        )
         try:
             with open(plan_path, "w", encoding="utf-8") as pf:
                 json.dump(result.plan_trace, pf, indent=2, default=str)

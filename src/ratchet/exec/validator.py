@@ -181,11 +181,14 @@ async def _validate_level_2_to_5(
     tools = VALIDATOR_TOOLS_BY_LEVEL.get(level, ["Read"])
     prompt = _render_validator_prompt(step, result, level)
 
-    schema_hint = (
+    validator_prompt = (
         "You are a code validation agent. Your job is to "
         "verify whether the implementation meets the "
         "success criterion.\n\n"
-        "Do NOT edit or write any files. You are read-only.\n\n"
+        "RULES:\n"
+        "- Do NOT edit or write any files. You are read-only.\n"
+        "- Only use your tools to read files and run read-only commands.\n"
+        "- Focus solely on whether the success criterion is met.\n\n"
         "IMPORTANT: You MUST end your response with a JSON "
         "block wrapped in ```json ... ``` containing your "
         "verdict in this exact schema:\n"
@@ -198,12 +201,7 @@ async def _validate_level_2_to_5(
     options = ClaudeAgentOptions(
         model=model,
         cwd=repo_path,
-        setting_sources=["project"],
-        system_prompt={
-            "type": "preset",
-            "preset": "claude_code",
-            "append": schema_hint,
-        },
+        system_prompt=validator_prompt,
         tools=tools,
         allowed_tools=tools,
         max_turns=cfg.max_validator_turns(level),

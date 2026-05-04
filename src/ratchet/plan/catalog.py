@@ -151,55 +151,6 @@ def _err(exc: Exception) -> dict[str, Any]:
     }
 
 
-def _build_validator_spec(
-    args: dict[str, Any],
-) -> ValidatorSpec:
-    """Construct a ValidatorSpec from tool arguments."""
-    return ValidatorSpec(
-        level=args["validation_level"],
-        success_criterion=args["success_criterion"],
-        command=args.get("validator_command"),
-        extra_context=args.get("validator_context"),
-    )
-
-
-def _build_step_from_args(
-    args: dict[str, Any],
-) -> Step:
-    """Build a Step from add_*_step tool arguments."""
-    common: dict[str, Any] = {
-        "id": args["id"],
-        "type": StepType(args["step_type"]),
-        "goal": args["goal"],
-        "briefing": args["briefing"],
-        "depends_on": args.get("depends_on", []),
-        "validator": _build_validator_spec(args),
-    }
-    intent_raw: str | None = args.get("intent")
-    if intent_raw is not None:
-        common["intent"] = StepIntent(intent_raw)
-
-    step_type = StepType(args["step_type"])
-
-    if step_type in (
-        StepType.IMPLEMENT_STEP,
-        StepType.UPDATE_DOCS_STEP,
-    ):
-        common["target_files"] = args.get(
-            "target_files", [],
-        )
-        common["creates_files"] = args.get(
-            "creates_files", [],
-        )
-
-    if step_type == StepType.IMPLEMENT_STEP:
-        common["deletes_files"] = args.get(
-            "deletes_files", [],
-        )
-
-    return Step.model_validate(common)
-
-
 # ---------------------------------------------------------------------------
 # check_prerequisites
 # ---------------------------------------------------------------------------
@@ -301,6 +252,27 @@ async def check_prerequisites(
 
 
 # ---------------------------------------------------------------------------
+# Default validation levels per step type
+# ---------------------------------------------------------------------------
+
+_DEFAULT_VALIDATION_LEVELS: dict[str, int] = {
+    "discovery_step": 1,
+    "implement_step": 3,
+    "simple_task_step": 2,
+    "verify_step": 1,
+    "update_docs_step": 2,
+}
+
+
+def _default_validation_level(step_type: str) -> int:
+    """Return the default validation level for a step type."""
+    cfg = _get_config()
+    return cfg.validation.level_by_step_type.get(
+        step_type, cfg.validation.default_level,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tool input schemas
 # ---------------------------------------------------------------------------
 
@@ -323,18 +295,16 @@ _TASK_CREATE_SCHEMA: dict[str, Any] = {
         "category": {
             "type": "string",
             "enum": [c.value for c in TaskCategory],
-            "description": "Task category.",
-        },
-        "repo_path": {
-            "type": "string",
             "description": (
-                "Absolute path to the repository."
+                "Task category. Use bug_fix for SWE-bench "
+                "issues, feature for new functionality."
             ),
         },
         "issue_id": {
             "type": "string",
             "description": (
-                "Optional SWE-bench or tracker ref."
+                "Optional tracker reference (e.g. "
+                "SWE-bench instance ID)."
             ),
         },
         "acceptance_criteria": {
@@ -349,10 +319,7 @@ _TASK_CREATE_SCHEMA: dict[str, Any] = {
             "description": "Free-form planner notes.",
         },
     },
-    "required": [
-        "title", "description",
-        "category", "repo_path",
-    ],
+    "required": ["title", "description", "category"],
 }
 
 _TASK_GET_SCHEMA: dict[str, Any] = {
@@ -439,182 +406,130 @@ _TASK_DELETE_SCHEMA: dict[str, Any] = {
     "required": ["task_id"],
 }
 
-_STEP_COMMON_PROPERTIES: dict[str, Any] = {
-    "id": {
-        "type": "string",
-        "description": "Unique step identifier.",
-    },
-    "goal": {
-        "type": "string",
-        "description": (
-            "Short description of what the "
-            "step must accomplish."
-        ),
-    },
-    "briefing": {
-        "type": "string",
-        "description": (
-            "Detailed instructions for the "
-            "executor agent."
-        ),
-    },
-    "depends_on": {
-        "type": "array",
-        "items": {"type": "string"},
-        "description": (
-            "Step IDs that must complete first."
-        ),
-    },
-    "success_criterion": {
-        "type": "string",
-        "description": (
-            "Human-readable pass/fail condition."
-        ),
-    },
-    "validation_level": {
-        "type": "integer",
-        "minimum": 1,
-        "maximum": 5,
-        "description": (
-            "Validation depth (1=subprocess, "
-            "2-5=LLM with increasing rigor)."
-        ),
-    },
-    "validator_command": {
-        "type": "string",
-        "description": (
-            "Shell command for level 1 validation."
-        ),
-    },
-    "validator_context": {
-        "type": "string",
-        "description": (
-            "Extra context for levels 2-5."
-        ),
-    },
-    "intent": {
-        "type": "string",
-        "enum": [i.value for i in StepIntent],
-        "description": "Semantic intent hint.",
-    },
-}
-
-_STEP_COMMON_REQUIRED: list[str] = [
-    "id",
-    "goal",
-    "briefing",
-    "success_criterion",
-    "validation_level",
-]
-
-_ADD_DISCOVERY_STEP_SCHEMA: dict[str, Any] = {
+_ADD_STEP_SCHEMA: dict[str, Any] = {
     "type": "object",
+    "description": (
+        "Add a step to the plan. Choose step_type based on "
+        "what the step does: discovery_step for reading/"
+        "exploring (tools: Read, Glob, Grep), "
+        "implement_step for code changes (tools: Read, Edit, "
+        "Write), simple_task_step for shell commands "
+        "(tools: Read, Bash), verify_step for checking "
+        "results (tools: Read, Grep, Glob), "
+        "update_docs_step for docs only (tools: Read, Edit, "
+        "Write). validation_level defaults to a sensible "
+        "value per step type if omitted."
+    ),
     "properties": {
         "step_type": {
             "type": "string",
-            "const": "discovery_step",
+            "enum": [t.value for t in StepType],
+            "description": (
+                "Type of step. implement_step for code "
+                "changes, discovery_step for exploration, "
+                "verify_step for checking, "
+                "simple_task_step for shell commands, "
+                "update_docs_step for docs."
+            ),
         },
-        **_STEP_COMMON_PROPERTIES,
-    },
-    "required": [
-        "step_type", *_STEP_COMMON_REQUIRED,
-    ],
-}
-
-_ADD_IMPLEMENT_STEP_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "step_type": {
+        "id": {
             "type": "string",
-            "const": "implement_step",
+            "description": (
+                "Unique step identifier (e.g. "
+                "'fix_regex', 'add_validation')."
+            ),
+        },
+        "goal": {
+            "type": "string",
+            "description": (
+                "Short description of what the step "
+                "must accomplish (1-2 sentences)."
+            ),
+        },
+        "briefing": {
+            "type": "string",
+            "description": (
+                "Detailed instructions for the executor "
+                "agent. Must be self-contained: include "
+                "file paths, line numbers, and exact "
+                "code changes. The executor has no "
+                "memory of previous steps."
+            ),
         },
         "target_files": {
             "type": "array",
             "items": {"type": "string"},
             "description": (
-                "Existing files to modify."
+                "Existing files to modify "
+                "(for implement_step, update_docs_step)."
             ),
         },
         "creates_files": {
             "type": "array",
             "items": {"type": "string"},
             "description": (
-                "New files to create."
+                "New files to create "
+                "(for implement_step, update_docs_step)."
             ),
         },
         "deletes_files": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Files to delete.",
-        },
-        **_STEP_COMMON_PROPERTIES,
-    },
-    "required": [
-        "step_type", *_STEP_COMMON_REQUIRED,
-    ],
-}
-
-_ADD_SIMPLE_TASK_STEP_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "step_type": {
-            "type": "string",
-            "const": "simple_task_step",
-        },
-        "command": {
-            "type": "string",
             "description": (
-                "Shell command to execute."
+                "Files to delete "
+                "(for implement_step only)."
             ),
         },
-        **_STEP_COMMON_PROPERTIES,
-    },
-    "required": [
-        "step_type", *_STEP_COMMON_REQUIRED,
-    ],
-}
-
-_ADD_VERIFY_STEP_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "step_type": {
-            "type": "string",
-            "const": "verify_step",
-        },
-        **_STEP_COMMON_PROPERTIES,
-    },
-    "required": [
-        "step_type", *_STEP_COMMON_REQUIRED,
-    ],
-}
-
-_ADD_UPDATE_DOCS_STEP_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "step_type": {
-            "type": "string",
-            "const": "update_docs_step",
-        },
-        "target_files": {
+        "depends_on": {
             "type": "array",
             "items": {"type": "string"},
             "description": (
-                "Docs files to modify."
+                "Step IDs that must complete first."
             ),
         },
-        "creates_files": {
-            "type": "array",
-            "items": {"type": "string"},
+        "success_criterion": {
+            "type": "string",
             "description": (
-                "New docs files to create."
+                "Human-readable pass/fail condition "
+                "for validation."
             ),
         },
-        **_STEP_COMMON_PROPERTIES,
+        "validation_level": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+            "description": (
+                "Validation depth. 1=subprocess exit "
+                "code, 2-5=LLM with increasing rigor. "
+                "Defaults: discovery=1, implement=3, "
+                "simple_task=2, verify=1, docs=2."
+            ),
+        },
+        "validator_command": {
+            "type": "string",
+            "description": (
+                "Shell command for level 1 validation."
+            ),
+        },
+        "validator_context": {
+            "type": "string",
+            "description": (
+                "Extra context for levels 2-5 "
+                "validation."
+            ),
+        },
+        "intent": {
+            "type": "string",
+            "enum": [i.value for i in StepIntent],
+            "description": "Semantic intent hint.",
+        },
     },
     "required": [
-        "step_type", *_STEP_COMMON_REQUIRED,
+        "step_type", "id", "goal", "briefing",
     ],
 }
+
+
 
 _EDIT_STEP_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -731,8 +646,6 @@ _INSERT_STEP_AFTER_SCHEMA: dict[str, Any] = {
             },
             "required": [
                 "id", "goal", "briefing",
-                "success_criterion",
-                "validation_level",
             ],
         },
     },
@@ -801,7 +714,7 @@ _DESCRIPTION_FIELDS: frozenset[str] = frozenset(
 
 @tool(
     "task_create",
-    "Create a new task with description.",
+    "Create a new task describing the issue to fix.",
     _TASK_CREATE_SCHEMA,
 )
 async def _task_create_handler(
@@ -810,11 +723,12 @@ async def _task_create_handler(
     """Handle task_create tool calls."""
     try:
         store = _get_task_store()
+        rp = args.get("repo_path") or _get_repo_path()
         desc = TaskDescription(
             title=args["title"],
             description=args["description"],
             category=TaskCategory(args["category"]),
-            repo_path=args["repo_path"],
+            repo_path=rp,
             issue_id=args.get("issue_id"),
             acceptance_criteria=args.get(
                 "acceptance_criteria", [],
@@ -969,26 +883,76 @@ async def _task_delete_handler(
 # ---------------------------------------------------------------------------
 
 
-def _add_step_wrapper(
+def _add_step_handler_impl(
     args: dict[str, Any],
 ) -> tuple[PlanStore, Step]:
-    """Common logic for add_*_step handlers."""
+    """Build and validate a step from add_step arguments."""
     store = _get_plan_store()
-    step = _build_step_from_args(args)
+    step_type_str: str = args["step_type"]
+    step_type = StepType(step_type_str)
+
+    # Apply defaults for optional fields
+    success_criterion: str = args.get(
+        "success_criterion", "",
+    )
+    if not success_criterion:
+        success_criterion = f"Step '{args['id']}' completes successfully"
+
+    validation_level: int = args.get(
+        "validation_level", 0,
+    ) or _default_validation_level(step_type_str)
+
+    val_spec = ValidatorSpec(
+        level=validation_level,
+        success_criterion=success_criterion,
+        command=args.get("validator_command"),
+        extra_context=args.get("validator_context"),
+    )
+
+    common: dict[str, Any] = {
+        "id": args["id"],
+        "type": step_type,
+        "goal": args["goal"],
+        "briefing": args["briefing"],
+        "depends_on": args.get("depends_on", []),
+        "validator": val_spec,
+    }
+    intent_raw: str | None = args.get("intent")
+    if intent_raw is not None:
+        common["intent"] = StepIntent(intent_raw)
+
+    if step_type in (
+        StepType.IMPLEMENT_STEP,
+        StepType.UPDATE_DOCS_STEP,
+    ):
+        common["target_files"] = args.get(
+            "target_files", [],
+        )
+        common["creates_files"] = args.get(
+            "creates_files", [],
+        )
+
+    if step_type == StepType.IMPLEMENT_STEP:
+        common["deletes_files"] = args.get(
+            "deletes_files", [],
+        )
+
+    step = Step.model_validate(common)
     return store, step
 
 
 @tool(
-    "add_discovery_step",
-    "Append a discovery step.",
-    _ADD_DISCOVERY_STEP_SCHEMA,
+    "add_step",
+    "Add a step to the plan. Specify step_type to control "
+    "which tools the executor can use.",
+    _ADD_STEP_SCHEMA,
 )
-async def _add_discovery_step_handler(
+async def _add_step_handler(
     args: dict[str, Any],
 ) -> dict[str, Any]:
-    """Handle add_discovery_step tool calls."""
+    """Handle add_step tool calls."""
     try:
-        store, step = _add_step_wrapper(args)
+        store, step = _add_step_handler_impl(args)
         await store.add_step(step)
         return _ok(step.model_dump(mode="json"))
     except (
@@ -998,103 +962,7 @@ async def _add_discovery_step_handler(
     ) as exc:
         return _err(exc)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Error in add_discovery_step")
-        return _err(exc)
-
-
-@tool(
-    "add_implement_step",
-    "Append an implement step.",
-    _ADD_IMPLEMENT_STEP_SCHEMA,
-)
-async def _add_implement_step_handler(
-    args: dict[str, Any],
-) -> dict[str, Any]:
-    """Handle add_implement_step tool calls."""
-    try:
-        store, step = _add_step_wrapper(args)
-        await store.add_step(step)
-        return _ok(step.model_dump(mode="json"))
-    except (
-        RatchetCatalogError,
-        RatchetStoreError,
-        ValueError,
-    ) as exc:
-        return _err(exc)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Error in add_implement_step")
-        return _err(exc)
-
-
-@tool(
-    "add_simple_task_step",
-    "Append a simple task step.",
-    _ADD_SIMPLE_TASK_STEP_SCHEMA,
-)
-async def _add_simple_task_step_handler(
-    args: dict[str, Any],
-) -> dict[str, Any]:
-    """Handle add_simple_task_step tool calls."""
-    try:
-        store, step = _add_step_wrapper(args)
-        await store.add_step(step)
-        return _ok(step.model_dump(mode="json"))
-    except (
-        RatchetCatalogError,
-        RatchetStoreError,
-        ValueError,
-    ) as exc:
-        return _err(exc)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Error in add_simple_task_step")
-        return _err(exc)
-
-
-@tool(
-    "add_verify_step",
-    "Append a verify step.",
-    _ADD_VERIFY_STEP_SCHEMA,
-)
-async def _add_verify_step_handler(
-    args: dict[str, Any],
-) -> dict[str, Any]:
-    """Handle add_verify_step tool calls."""
-    try:
-        store, step = _add_step_wrapper(args)
-        await store.add_step(step)
-        return _ok(step.model_dump(mode="json"))
-    except (
-        RatchetCatalogError,
-        RatchetStoreError,
-        ValueError,
-    ) as exc:
-        return _err(exc)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Error in add_verify_step")
-        return _err(exc)
-
-
-@tool(
-    "add_update_docs_step",
-    "Append an update docs step.",
-    _ADD_UPDATE_DOCS_STEP_SCHEMA,
-)
-async def _add_update_docs_step_handler(
-    args: dict[str, Any],
-) -> dict[str, Any]:
-    """Handle add_update_docs_step tool calls."""
-    try:
-        store, step = _add_step_wrapper(args)
-        await store.add_step(step)
-        return _ok(step.model_dump(mode="json"))
-    except (
-        RatchetCatalogError,
-        RatchetStoreError,
-        ValueError,
-    ) as exc:
-        return _err(exc)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Error in add_update_docs_step")
+        logger.exception("Error in add_step")
         return _err(exc)
 
 
@@ -1182,7 +1050,7 @@ async def _remove_step_handler(
 
 @tool(
     "insert_step_after",
-    "Insert a step after the anchor.",
+    "Insert a step after the anchor step in the plan.",
     _INSERT_STEP_AFTER_SCHEMA,
 )
 async def _insert_step_after_handler(
@@ -1190,14 +1058,13 @@ async def _insert_step_after_handler(
 ) -> dict[str, Any]:
     """Handle insert_step_after tool calls."""
     try:
-        store = _get_plan_store()
         anchor_id: str = args["anchor_id"]
         stype: str = args["step_type"]
         step_args: dict[str, Any] = args["step_args"]
         full_args = {
             "step_type": stype, **step_args,
         }
-        step = _build_step_from_args(full_args)
+        store, step = _add_step_handler_impl(full_args)
         await store.insert_step_after(anchor_id, step)
         return _ok(step.model_dump(mode="json"))
     except (
@@ -1332,16 +1199,28 @@ async def _step_handler(
             validate,
         )
 
-        prev_ctx: str = args.get(
-            "prev_context", "",
-        )
+        # Build prev_context: planner-provided + auto from State
+        planner_ctx: str = args.get("prev_context", "")
+        deps = state.resolve(step.depends_on)
+        auto_ctx_parts: list[str] = []
+        for sid, out in deps.items():
+            auto_ctx_parts.append(
+                f"[{sid}] {out.summary}"
+            )
+        auto_ctx = '\n'.join(auto_ctx_parts)
+        if planner_ctx and auto_ctx:
+            prev_ctx = auto_ctx + '\n\n' + planner_ctx
+        else:
+            prev_ctx = planner_ctx or auto_ctx
+
+        restrictions = cfg.restrictions
 
         result = await execute_step(
             step=step,
             cfg=cfg,
             repo_path=rp,
             state=state,
-            restrictions="",
+            restrictions=restrictions,
             prev_context=prev_ctx,
         )
 
@@ -1414,11 +1293,7 @@ TASK_TOOL_NAMES: list[str] = [
 ]
 
 PLAN_TOOL_NAMES: list[str] = [
-    "add_discovery_step",
-    "add_implement_step",
-    "add_simple_task_step",
-    "add_verify_step",
-    "add_update_docs_step",
+    "add_step",
     "edit_step",
     "remove_step",
     "insert_step_after",
@@ -1442,11 +1317,7 @@ _ALL_HANDLERS = [
     _task_update_handler,
     _task_delete_handler,
     # Plan tools
-    _add_discovery_step_handler,
-    _add_implement_step_handler,
-    _add_simple_task_step_handler,
-    _add_verify_step_handler,
-    _add_update_docs_step_handler,
+    _add_step_handler,
     _edit_step_handler,
     _remove_step_handler,
     _insert_step_after_handler,

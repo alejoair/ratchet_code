@@ -98,8 +98,12 @@ Workflow:
 Guidelines:
 - Read the relevant source files BEFORE creating the plan.
 - Make the minimal set of changes required to fix the issue.
-- Do NOT modify test files unless the issue requires it.
+- Do NOT modify test files unless the issue explicitly requires it.
 - Do NOT add unrelated refactors, comments, or formatting changes.
+- Do NOT create test files, documentation files, or README files.
+- Do NOT delete any existing files.
+- Only modify the minimum necessary source files.
+- Prefer minimal, surgical changes over refactors.
 - Each step briefing must be self-contained: include file paths,
   line numbers, and exact instructions for the executor.
 - The executor has NO memory between steps -- include all context
@@ -155,7 +159,6 @@ async def run_orchestrated(
     options = ClaudeAgentOptions(
         model=model,
         cwd=repo_path,
-        setting_sources=["user", "project", "local"],
         system_prompt=_SYSTEM_PROMPT,
         tools=all_tools,
         allowed_tools=all_tools,

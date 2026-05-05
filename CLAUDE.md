@@ -3,32 +3,49 @@
 ## file_tree
 
 ```
-ratchet/
-├── pyproject.toml
-├── ratchet.config.json
-├── CLAUDE.md
+ratchet_code/
+├── bench_results/
+│   ├── astropy-14369.jsonl
+│   └── evaluation.md
+├── examples/
+│   └── swebench_adapter.py
 ├── src/ratchet/
 │   ├── __init__.py
 │   ├── __main__.py
-│   ├── config.py
+│   ├── chat.py
 │   ├── claude_md.py
-│   ├── state.py
-│   ├── solve.py
+│   ├── config.py
 │   ├── orchestrator.py
-│   ├── plan/
+│   ├── solve.py
+│   ├── state.py
+│   ├── exec/
 │   │   ├── __init__.py
-│   │   ├── store.py
-│   │   ├── schema.py
-│   │   ├── catalog.py
-│   │   └── planner.py
-│   └── exec/
+│   │   ├── executor.py
+│   │   ├── hooks.py
+│   │   ├── plan_executor.py
+│   │   └── validator.py
+│   └── plan/
 │       ├── __init__.py
-│       ├── executor.py
-│       ├── validator.py
-│       ├── hooks.py
-│       └── plan_executor.py
-└── examples/
-    └── swebench_adapter.py
+│       ├── catalog.py
+│       ├── planner.py
+│       ├── schema.py
+│       └── store.py
+├── test_context_tools.py
+├── test_orchestrated.py
+├── test_prompt.txt
+├── test_sdk.py
+├── test_solve.py
+├── test_validator_integration.py
+├── test_validator_level_1.py
+├── test_validator_levels_2_5.py
+├── .gitignore
+├── =2.0
+├── bench_rubric.md
+├── CLAUDE.md
+├── npm
+├── pyproject.toml
+├── ratchet.config.json
+└── TEST_INTEGRATION_README.md
 ```
 
 ## design docs (Google Drive)
@@ -144,14 +161,16 @@ Returned by the validator. Levels 2-5 produce it via `output_format`; level 1 co
 
 ### Module responsibilities
 
-`__main__.py` — CLI entry point. Accepts `repo_path` positional arg plus
-`--prompt TEXT` or `--prompt-file PATH`, `--model`, `--config`.
+`__main__.py` — CLI entry point with two subcommands: `solve` and `chat`.
+`solve` accepts `repo_path` plus `--prompt TEXT` or `--prompt-file PATH`,
+`--model`, `--config`, `--instance-id`, `--max-turns`, `--cost-limit`.
 Calls `solve()` and captures the `SolveResult` to emit a
 `RATCHET_METRICS:{...}` JSON line with real token/cost/turn data to stdout
 for the vexp-swe-bench harness. Also writes a `.ratchet.log` file (all
 session logging) and a `.ratchet_plan.json` file (plan trace) next to the
-repo directory. Installed as the `ratchet` console script via
-`pyproject.toml`.
+repo directory. `chat` accepts an optional `repo_path` (defaults to cwd),
+`--model`, `--config`. Starts an interactive REPL with the planner.
+Installed as the `ratchet` console script via `pyproject.toml`.
 
 `solve.py` — `async def solve(repo_path, request, config_path, model) -> SolveResult`.
 Entry point for library callers. Loads config (or builds a default),
@@ -176,11 +195,11 @@ for standalone planner sessions without catalog MCP.
 
 `claude_md.py` — `parse_claude_md(repo_path) -> ClaudeMd`. Parses the three required sections (file_tree, architecture, restrictions). Raises `ValueError` if any section is missing.
 
-`plan/catalog.py` — in-process MCP server (`ratchet_catalog`) with all custom tools: Task CRUD, Plan CRUD, and the `step` execution tool. All tools access state via `ContextVar`. Contains `check_prerequisites`. **Implemented**: 5 Task tools, 10 Plan tools, `step` execution tool, `check_prerequisites`, all 5 ContextVars (`_task_store`, `_plan_store`, `_state`, `_repo_path`, `_config`). `bind_catalog_context(task_store, plan_store, state, repo_path, cfg)`. Tool names are registered without prefix (e.g. `task_create`); the orchestrator prefixes them with `mcp__ratchet_catalog__` for the CLI.
+`plan/catalog.py` — in-process MCP server (`ratchet_catalog`) with all custom tools: Task CRUD, Plan CRUD, and the `step` execution tool. All tools access state via `ContextVar`. Contains `check_prerequisites`. **Implemented**: 5 Task tools (task_create, task_get, task_update_what, task_update_status, task_delete), unified `add_step` tool (replaces per-type add_*_step tools), 9 other Plan tools (edit_step, remove_step, insert_step_after, mark_step_in_progress, mark_step_completed, mark_step_failed, view_plan, submit_plan, get_next_runnable), `step` execution tool, `check_prerequisites`, all 5 ContextVars. `bind_catalog_context(task_store, plan_store, state, repo_path, cfg)`. Tool names are registered without prefix (e.g. `task_create`); the orchestrator prefixes them with `mcp__ratchet_catalog__` for the CLI.
 
 `exec/executor.py` — `execute_step(step, cfg, repo_path, state, restrictions, prev_context) -> StepResult`. Builds options with `TOOLS_BY_STEP_TYPE` sandbox, runs SDK client, captures StepOutput via text-based JSON parsing. **Implemented**: render_step_prompt, TOOLS_BY_STEP_TYPE mapping, structured output capture with regex-based JSON extraction.
 
-`exec/validator.py` — `validate(step, result, cfg, repo_path) -> ValidationVerdict`. Level 1 is subprocess; levels 2-5 are SDK clients with read-only sandbox. **Implemented**: all 5 levels, VALIDATOR_TOOLS_BY_LEVEL, render_validator_prompt. Currently returns a "no model configured" verdict for levels 2-5 when no validator model is set in config.
+`exec/validator.py` — `validate(step, result, cfg, repo_path) -> ValidationVerdict`. Level 1 is subprocess (auto-passes if no command provided); levels 2-5 are SDK clients with read-only sandbox. **Implemented**: all 5 levels, VALIDATOR_TOOLS_BY_LEVEL, render_validator_prompt. Levels 2-5 need a validator model configured in `ratchet.config.json` under `models.validator_by_level`.
 
 `exec/hooks.py` — `build_hooks(cfg, step, is_validator=False) -> list`. Returns hook list for ruff_on_edit, commit_format_check, bash_whitelist, validator_no_write. **Implemented**: all 4 hooks, is_validator guard.
 
@@ -188,9 +207,11 @@ for standalone planner sessions without catalog MCP.
 
 `orchestrator.py` — starts the planner session as a live SDK client, injects the ratchet_catalog MCP server (with ContextVars bound to active PlanStore, TaskStore, State, Config, repo_path), streams messages to/from the user. Prefixes MCP tool names with `mcp__ratchet_catalog__` in `tools` and `allowed_tools` so the CLI recognizes and auto-approves them. Logs planner activity at INFO level. **Implemented**: `run_orchestrated(repo_path, request, cfg, model) -> SolveResult`.
 
+`chat.py` — interactive REPL for the ratchet planner. Uses `ClaudeSDKClient` for persistent multi-turn conversation. Renders assistant messages, tool calls, thinking blocks, and results with ANSI formatting. Same tool set as the orchestrator (PLANNER_TOOLS + prefixed MCP catalog tools). **Implemented**: `run_chat(repo_path, cfg, model)`.
+
 ### Data flow
 
-1. `ratchet <repo_path> --prompt ...` -> `solve(repo_path, request, config_path, model)`
+1. `ratchet solve <repo_path> --prompt ...` -> `solve(repo_path, request, config_path, model)`
 2. `solve()` loads config (or builds default), delegates to `run_orchestrated()`.
 3. Orchestrator creates TaskStore, PlanStore, State, binds ContextVars, builds catalog MCP.
 4. Planner has read-only tools (Glob, Grep, LS, Read) plus prefixed MCP catalog tools.
@@ -211,14 +232,15 @@ for standalone planner sessions without catalog MCP.
 | `plan/catalog.py` | Done | 5 Task tools + 10 Plan tools + step execution tool + check_prerequisites + 5 ContextVars |
 | `plan/planner.py` | Done | PLANNER_TOOLS (read-only), build_planner_options() |
 | `config.py` | Done | Config, ExecutorModels, ValidationConfig, BudgetConfig, HooksConfig. Load from JSON, executor_model_for(), validator_model_for(), max_validator_turns() |
-| `__main__.py` | Done | CLI with --prompt/--prompt-file/--model/--config. File logging (.ratchet.log) + plan trace (.ratchet_plan.json) |
+| `__main__.py` | Done | CLI with solve/chat subcommands, --prompt/--prompt-file/--model/--config/--instance-id. File logging + plan trace |
 | `solve.py` | Done | Single mode: orchestrated via run_orchestrated(). SolveResult with patch + metrics |
 | `claude_md.py` | Done | Parse CLAUDE.md sections (file_tree, architecture, restrictions) |
 | `exec/executor.py` | Done | TOOLS_BY_STEP_TYPE sandbox, render_step_prompt, text-based JSON output capture |
-| `exec/validator.py` | Done | All 5 levels (subprocess + SDK client). Levels 2-5 need validator model in config |
+| `exec/validator.py` | Done | All 5 levels. Level 1 auto-passes without command. Levels 2-5 need validator model in config |
 | `exec/hooks.py` | Done | ruff_on_edit, commit_format_check, bash_whitelist, validator_no_write |
 | `exec/plan_executor.py` | Done | run_step() with full lifecycle: resolve, check, execute, validate, update |
 | `orchestrator.py` | Done | run_orchestrated() with catalog MCP injection, ContextVar binding, MCP tool name prefixing |
+| `chat.py` | Done | Interactive REPL with ClaudeSDKClient, ANSI rendering, persistent multi-turn planner session |
 
 All modules implemented. The MVP is complete and verified end-to-end on SWE-bench instances.
 
@@ -256,7 +278,7 @@ prefix when building `ClaudeAgentOptions`.
 ### vexp-swe-bench integration
 
 The harness adapter lives in the cloned `vexp-swe-bench` repo at
-`src/agents/ratchet.ts`. It spawns `ratchet <repo_path> --prompt-file <tmp>`
+`src/agents/ratchet.ts`. It spawns `ratchet solve <repo_path> --prompt-file <tmp>`
 and parses the `RATCHET_METRICS:` line from stdout. Registered in
 `src/agents/registry.ts` as `"ratchet"`. Includes cross-platform kill
 signal handling (Windows compatibility).
@@ -313,8 +335,8 @@ node dist/cli.js run --agent ratchet --instances id1,id2,id3 --no-vexp
 - **Home**: `C:\Users\user`
 - **Shell**: `C:\Program Files\Git\usr\bin\bash.exe`
 - **Python**: `3.14.2` → `C:\Python314\python.exe`
-- **Date/Time**: 2026-05-04 17:47:34 (SA Pacific Standard Time)
-- **Unix Timestamp**: `1777934854`
+- **Date/Time**: 2026-05-04 23:03:28 (SA Pacific Standard Time)
+- **Unix Timestamp**: `1777953808`
 
 
 
@@ -355,11 +377,13 @@ ratchet_code/
 │       │   └── store.py
 │       ├── __init__.py
 │       ├── __main__.py
+│       ├── chat.py
 │       ├── claude_md.py
 │       ├── config.py
 │       ├── orchestrator.py
 │       ├── solve.py
 │       └── state.py
+├── temp_validator_test/
 ├── .gitignore
 ├── =2.0
 ├── bench_rubric.md
@@ -367,44 +391,53 @@ ratchet_code/
 ├── npm
 ├── pyproject.toml
 ├── ratchet.config.json
+├── test_context_tools.py
+├── TEST_INTEGRATION_README.md
 ├── test_orchestrated.py
 ├── test_prompt.txt
 ├── test_sdk.py
-└── test_solve.py
+├── test_solve.py
+├── test_validator_integration.py
+├── test_validator_level_1.py
+└── test_validator_levels_2_5.py
 ```
 
 ### Project Stats
 
-- **Python files**: 21
+- **Python files**: 26
 - **JS/TS files**: 0
-- **Total tracked files**: 21
+- **Total tracked files**: 26
 
 ### Git Info
 
 - **Branch**: `claude/download-claude-md-HTScD`
+  - 7bb2cc4 feat(cli): add chat subcommand and auto-pass level 1 validator without command
+  - 55cf496 refactor(catalog): unify add_*_step into add_step, auto-fill defaults, pass restrictions
   - 1b9b713 fix(solve,validator): load config from repo path and handle nested SDK errors
-  - 27499c3 fix(orchestrator): prefix MCP tool names for CLI auto-approval
-  - 99b6e3a fix(exec): replace output_format with text-based JSON parsing for SDK compat
 
 ### Git Status
 
 ```
   M CLAUDE.md
-   M src/ratchet/__main__.py
-   M src/ratchet/config.py
+   M src/ratchet/chat.py
    M src/ratchet/exec/executor.py
-   M src/ratchet/exec/validator.py
+   M src/ratchet/exec/plan_executor.py
    M src/ratchet/orchestrator.py
    M src/ratchet/plan/catalog.py
-   M src/ratchet/solve.py
+   M src/ratchet/plan/schema.py
   ?? =2.0
+  ?? TEST_INTEGRATION_README.md
   ?? bench_results/
   ?? bench_rubric.md
   ?? npm
+  ?? test_context_tools.py
   ?? test_orchestrated.py
   ?? test_prompt.txt
   ?? test_sdk.py
   ?? test_solve.py
+  ?? test_validator_integration.py
+  ?? test_validator_level_1.py
+  ?? test_validator_levels_2_5.py
 ```
 
 ---

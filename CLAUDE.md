@@ -9,43 +9,48 @@ ratchet_code/
 │   └── evaluation.md
 ├── examples/
 │   └── swebench_adapter.py
-├── src/ratchet/
-│   ├── __init__.py
-│   ├── __main__.py
-│   ├── chat.py
-│   ├── claude_md.py
-│   ├── config.py
-│   ├── orchestrator.py
-│   ├── solve.py
-│   ├── state.py
-│   ├── exec/
-│   │   ├── __init__.py
-│   │   ├── executor.py
-│   │   ├── hooks.py
-│   │   ├── plan_executor.py
-│   │   └── validator.py
-│   └── plan/
+├── src/
+│   └── ratchet/
+│       ├── exec/
+│       │   ├── __init__.py
+│       │   ├── context_builder.py
+│       │   ├── executor.py
+│       │   ├── plan_executor.py
+│       │   ├── refiner.py
+│       │   └── validator.py
+│       ├── plan/
+│       │   ├── __init__.py
+│       │   ├── catalog.py
+│       │   ├── planner.py
+│       │   ├── schema.py
+│       │   └── store.py
 │       ├── __init__.py
-│       ├── catalog.py
-│       ├── planner.py
-│       ├── schema.py
-│       └── store.py
+│       ├── __main__.py
+│       ├── chat.py
+│       ├── claude_md.py
+│       ├── config.py
+│       ├── orchestrator.py
+│       ├── solve.py
+│       └── state.py
+├── temp_validator_test/
+├── .gitignore
+├── =2.0
+├── bench_rubric.md
+├── CLAUDE.md
+├── npm
+├── output.json
+├── pyproject.toml
+├── ratchet.config.json
+├── refiner_rubric.md
 ├── test_context_tools.py
+├── TEST_INTEGRATION_README.md
 ├── test_orchestrated.py
 ├── test_prompt.txt
 ├── test_sdk.py
 ├── test_solve.py
 ├── test_validator_integration.py
 ├── test_validator_level_1.py
-├── test_validator_levels_2_5.py
-├── .gitignore
-├── =2.0
-├── bench_rubric.md
-├── CLAUDE.md
-├── npm
-├── pyproject.toml
-├── ratchet.config.json
-└── TEST_INTEGRATION_README.md
+└── test_validator_levels_2_5.py
 ```
 
 ## design docs (Google Drive)
@@ -60,10 +65,10 @@ All design documents live in the "Ratchet Code" folder on Google Drive
 | `03_planstore.md` | `1BkMfRQf5adOzJyUBKr6fCwciShuX7Pbq` | PlanStore class API (add_step, edit_step, remove_step, insert_step_after, mark_*, view, submit, next_runnable_id) and all mutation rules (lock, status guards, DAG constraints). |
 | `03b_taskstore.md` | `1i3OKuJw6P56BS5ssfh9aeZBF9gzfRFLR` | TaskStore class API (create, get, update_*, set_*, view) and rules. Single active task per session, status lifecycle enforcement. |
 | `04_catalog_tools.md` | `19fyHSpBiNE8JbdqbwCa2rNezbuyu8vpQ` | Full specification of the `ratchet_catalog` MCP server: Task tools (create_task, update_task_what, view_task), Plan tools (add_*_step, edit_step, remove_step, insert_step_after, view_plan, submit_plan), the `step` execution tool contract, and prerequisite check rules. |
-| `05_executor_validator.md` | `1OfO4AwUL1qE-KAUTVwsUEKCkyqKWlVhf` | Executor options construction (TOOLS_BY_STEP_TYPE sandbox, output_format, step prompt rendering), validator levels 1-5 (tools, turns, behavior), and hooks (ruff_on_edit, commit_format_check, bash_whitelist, validator_no_write). |
-| `06_config.md` | `18M4af6OrIAY1rZelarGkChk3AQEj3yLB` | ratchet.config.json schema, Config Pydantic model (ExecutorModels, ValidationConfig, BudgetConfig, HooksConfig), CLAUDE.md contract, solve() entry point, and SWE-bench adapter. |
+| `05_executor_validator.md` | `1OfO4AwUL1qE-KAUTVwsUEKCkyqKWlVhf` | Executor options construction (TOOLS_BY_STEP_TYPE sandbox, output_format, step prompt rendering), validator levels 1-5 (tools, turns, behavior). |
+| `06_config.md` | `18M4af6OrIAY1rZelarGkChk3AQEj3yLB` | ratchet.config.json schema, Config Pydantic model (ExecutorModels, ValidationConfig, BudgetConfig), CLAUDE.md contract, solve() entry point, and SWE-bench adapter. |
 | `RATCHET_OVERVIEW.md` | `1owEe267C-jofBb-KTwXiINxJ3GpNUEnQ` | Narrative overview: architecture rationale, data model summary, CLAUDE.md contract, configuration, non-obvious design decisions, and current status. |
-| `RATCHET_SPEC.md` | `1qHl0HV5CIjgkLt5ERBGniXrOi-63OX5o` | Complete specification combining all numbered docs (01-06) into a single reference: data model, PlanStore rules, catalog tools, executor, validator, hooks, config, entry point, and critical API notes. |
+| `RATCHET_SPEC.md` | `1qHl0HV5CIjgkLt5ERBGniXrOi-63OX5o` | Complete specification combining all numbered docs (01-06) into a single reference: data model, PlanStore rules, catalog tools, executor, validator, config, entry point, and critical API notes. |
 | `RATCHET_THEORY.md` | `1iVWZMLMAh2d8222xajzJzNXndhNr4mt3` | Theoretical foundations: core hypothesis on phase separation, tool restriction vs prompt instruction, typed plans as tool calls, prerequisites as first-class concept, planner as intelligent layer, connection to Plan-and-Execute/MFR-PDDL literature, validation as configurable dimension, no repair loop rationale, and scope limitations. |
 | `CLAUDE.md` (Drive copy) | `1InKa4Vg8mWociTT2MqUPQWS-b9Epl7XS` | Canonical CLAUDE.md template from the design docs. Defines file_tree, architecture (entities, module responsibilities, data flow, ContextVars, SDK notes), and restrictions. |
 
@@ -73,11 +78,11 @@ All design documents live in the "Ratchet Code" folder on Google Drive
 
 - `Task`, `TaskDescription`, `TaskStatus`, `TaskCategory` — `plan/schema.py`
 - `Step`, `StepType`, `StepIntent`, `ValidatorSpec` — `plan/schema.py`
-- `StepOutput`, `StepResult`, `ValidationVerdict` — `plan/schema.py`
+- `StepOutput`, `StepResult`, `ValidationVerdict`, `RefinementVerdict`, `ContextResult` — `plan/schema.py`
 - `PlanStore`, `StepStatus` — `plan/store.py`
 - `TaskStore` — `plan/store.py`
 - `State` — `state.py`
-- `Config`, `ValidationConfig`, `BudgetConfig`, `HooksConfig` — `config.py`
+- `Config`, `ExecutorModels`, `ValidationConfig`, `BudgetConfig`, `PlanningRules`, `RefinerConfig`, `ContextBuilderConfig` — `config.py`
 - `ClaudeMd` — `claude_md.py`
 
 ### Data models (`plan/schema.py`)
@@ -159,6 +164,30 @@ Returned by the validator. Levels 2-5 produce it via `output_format`; level 1 co
 | `diagnosis` | `str` | `""` | Explanation of the verdict |
 | `suggested_fixes` | `list[str]` | `[]` | Actionable fixes if validation failed |
 
+#### RefinementVerdict
+
+Returned by the plan refiner on `submit_plan`. Evaluates the plan against a rubric and returns either approval or rejection with actionable recommendations.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `approved` | `bool` | required | Whether the plan meets the quality threshold |
+| `score` | `int` (0-100) | required | Overall plan quality score; plans below the configured threshold are rejected |
+| `diagnosis` | `str` | `""` | Explanation of the verdict and scoring rationale |
+| `recommendations` | `list[str]` | `[]` | Actionable improvements for the planner to address |
+| `rubric_scores` | `dict[str, int]` | `{}` | Per-dimension rubric scores; keys are dimension names, values 0-5 |
+| `suggested_splits` | `list[str]` | `[]` | Step IDs that are too complex and should be split into multiple smaller steps |
+
+#### ContextResult
+
+Enriched context produced by the context builder agent. Returned by `build_context()` and prepended to the executor's `prev_context` so the executor has precise, repo-grounded information about the code it needs to modify.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `enriched_context` | `str` | required | Markdown-formatted context block with function signatures, imports, file dependencies, and other relevant info |
+| `files_read` | `list[str]` | `[]` | Files that were read during context building, for traceability |
+| `functions_found` | `list[str]` | `[]` | Function/class signatures discovered in the target files |
+| `notes` | `str` | `""` | Additional observations from context gathering |
+
 ### Module responsibilities
 
 `__main__.py` — CLI entry point with two subcommands: `solve` and `chat`.
@@ -191,7 +220,66 @@ for standalone planner sessions without catalog MCP.
 
 `state.py` — `State` class. Holds logical outputs (StepOutput) indexed by step_id. No asyncio lock needed (single-writer: plan_executor). **Implemented**: record(), resolve(), get().
 
-`config.py` — `Config` and sub-models (`ExecutorModels`, `ValidationConfig`, `BudgetConfig`, `HooksConfig`). Loads from `ratchet.config.json` via `Config.load(path)`. Provides `executor_model_for(step_type)` and `validator_model_for(level)` with fallback defaults. **Implemented**: all models, load(), executor_model_for(), validator_model_for(), max_validator_turns().
+`config.py` — `Config` and sub-models (`ExecutorModels`, `ValidationConfig`, `BudgetConfig`, `PlanningRules`, `RefinerConfig`, `ContextBuilderConfig`). Loads from `ratchet.config.json` via `Config.load(path)`. Provides `executor_model_for(step_type)` and `validator_model_for(level)` with fallback defaults. **Implemented**: all models, load(), executor_model_for(), validator_model_for(), max_validator_turns(), default_validation_level().
+
+#### Configuration sections (`ratchet.config.json`)
+
+The config file is divided into the following top-level sections:
+
+**`models`** — Model selection for planner, executor, and validator.
+
+| Key | Type | Description |
+|---|---|---|
+| `planner` | `str` | Model ID for the planner session |
+| `executor` | `ExecutorModels` | Per-step-type model overrides (default, implement_step, update_docs_step) |
+| `validator_by_level` | `dict[str, str \| null]` | Model per validation level (1-5); `null` for level 1 (subprocess) |
+
+**`validation`** — Default validation level and turn budgets.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `default_level` | `int` (1-5) | `3` | Default validation level when not specified |
+| `max_turns_by_level` | `dict[str, int]` | `{"1":0,"2":1,"3":3,"4":5,"5":10}` | Max LLM turns per validation level |
+| `level_by_step_type` | `dict[str, int]` | see code | Default validation level per step type |
+
+**`budgets`** — Global budget limits for a single solve session.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `max_executor_turns` | `int` | `20` | Max turns per executor step |
+| `max_planner_turns` | `int` | `200` | Max turns for the planner session |
+| `max_total_steps` | `int` | `50` | Max number of steps in a plan |
+
+**`planning_rules`** — Enforced planning constraints checked at submit and execution.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `require_discovery_before` | `list[str]` | `["implement_step"]` | Step types that require at least one completed discovery_step in their depends_on list |
+| `max_steps` | `int` | `50` | Maximum number of steps allowed in a plan |
+| `min_steps` | `int` | `0` | Minimum number of steps required in a plan |
+
+**`refiner`** — Plan refinement agent configuration. The refiner runs on `submit_plan` and evaluates the plan against a rubric, returning approval or rejection with actionable recommendations. Disabled by default.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | `bool` | `false` | Whether the refiner agent is active |
+| `model` | `str \| null` | `null` | Model ID for the refiner SDK session. Falls back to the planner model if not set |
+| `rubric_path` | `str` | `"refiner_rubric.md"` | Path to the rubric markdown file used to score plans |
+| `max_turns` | `int` | `3` | Max turns for the refiner SDK session |
+| `min_score` | `int` (0-100) | `60` | Minimum score to approve a plan. Plans scoring below this are rejected with recommendations |
+| `auto_reject_below` | `int` (0-100) | `30` | Plans scoring below this threshold are rejected outright with no recommendations |
+
+The refiner scores plans across six dimensions (Goal Clarity, Dependency Correctness, Scope Appropriateness, File Coverage, Validation Alignment, Step Complexity), each 0-5, summed to a raw 0-30 score then scaled to 0-100. It returns a `RefinementVerdict` with `approved`, per-dimension `rubric_scores`, `recommendations`, and `suggested_splits` for steps that are too complex.
+
+**`context_builder`** — Context builder agent configuration. The context builder runs before each step execution to enrich the step briefing with precise, repo-grounded information such as function signatures, import dependencies, and file relationships. Disabled by default.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | `bool` | `false` | Whether the context builder is active |
+| `model` | `str \| null` | `null` | Model ID for the context builder SDK session. Falls back to the executor model for the step if not set |
+| `max_turns` | `int` | `5` | Max turns for the builder SDK session |
+
+When enabled, the context builder runs a short SDK session with read-only tools (Read, Grep, Glob) to inspect the repository before each step execution. The resulting `ContextResult.enriched_context` is prepended to the executor's `prev_context` in `plan_executor.run_step()`, giving the executor precise, repo-grounded information before writing code.
 
 `claude_md.py` — `parse_claude_md(repo_path) -> ClaudeMd`. Parses the three required sections (file_tree, architecture, restrictions). Raises `ValueError` if any section is missing.
 
@@ -201,9 +289,12 @@ for standalone planner sessions without catalog MCP.
 
 `exec/validator.py` — `validate(step, result, cfg, repo_path) -> ValidationVerdict`. Level 1 is subprocess (auto-passes if no command provided); levels 2-5 are SDK clients with read-only sandbox. **Implemented**: all 5 levels, VALIDATOR_TOOLS_BY_LEVEL, render_validator_prompt. Levels 2-5 need a validator model configured in `ratchet.config.json` under `models.validator_by_level`.
 
-`exec/hooks.py` — `build_hooks(cfg, step, is_validator=False) -> list`. Returns hook list for ruff_on_edit, commit_format_check, bash_whitelist, validator_no_write. **Implemented**: all 4 hooks, is_validator guard.
 
 `exec/plan_executor.py` — `run_step(step_id, prev_context, plan_store, state, cfg, repo_path, restrictions) -> dict`. Python function that implements the `step` tool body: resolve step, check_prerequisites, mark_in_progress, execute_step, validate, mark_completed/failed, return verdict JSON. **Implemented**: full step lifecycle.
+
+`exec/context_builder.py` — `build_context(step, cfg, repo_path, deps) -> ContextResult`. Pre-execution context enrichment agent. Runs a short SDK session with read-only tools (Read, Grep, Glob) to inspect the repository and gather function signatures, import dependencies, test files, and other context relevant to the step being executed. The resulting `ContextResult.enriched_context` is prepended to the executor's `prev_context` in `plan_executor.run_step()` so the executor has precise, repo-grounded information before writing code. Guarded by `cfg.context_builder.enabled` (defaults to `False`). Uses a dedicated model from `cfg.context_builder.model`. Internal helpers: `_render_builder_prompt(step, deps)` builds the prompt from step metadata and prerequisite outputs; `_parse_context(msg)` extracts the `ContextResult` from the SDK result via regex-based JSON parsing.
+
+`exec/refiner.py` — `refine(steps, rationale, cfg, repo_path) -> RefinementVerdict`. Plan quality review agent. Runs on `submit_plan` (called from `catalog.py`) to evaluate the plan against a configurable rubric (`refiner_rubric.md`). Runs a no-tool SDK session that scores the plan across six dimensions (Goal Clarity, Dependency Correctness, Scope Appropriateness, File Coverage, Validation Alignment, Step Complexity), each 0-5, scaled to an overall 0-100 score. Returns a `RefinementVerdict` with `approved` (score >= `cfg.refiner.min_score`), per-dimension `rubric_scores`, `recommendations` for the planner, and `suggested_splits` for steps that are too complex. Guarded by `cfg.refiner.enabled` (defaults to `False`). Uses a dedicated model from `cfg.refiner.model`. Plans scoring below `cfg.refiner.auto_reject_below` are automatically rejected. Internal helpers: `_render_plan_text(steps, rationale)` formats the plan for the refiner prompt; `_parse_verdict(msg)` extracts the `RefinementVerdict` from the SDK result.
 
 `orchestrator.py` — starts the planner session as a live SDK client, injects the ratchet_catalog MCP server (with ContextVars bound to active PlanStore, TaskStore, State, Config, repo_path), streams messages to/from the user. Prefixes MCP tool names with `mcp__ratchet_catalog__` in `tools` and `allowed_tools` so the CLI recognizes and auto-approves them. Logs planner activity at INFO level. **Implemented**: `run_orchestrated(repo_path, request, cfg, model) -> SolveResult`.
 
@@ -226,19 +317,20 @@ for standalone planner sessions without catalog MCP.
 
 | Module | Status | Notes |
 |---|---|---|
-| `plan/schema.py` | Done | All models: Task, TaskDescription, TaskStatus, TaskCategory, Step, StepType, StepIntent, ValidatorSpec, StepOutput, StepResult, ValidationVerdict |
+| `plan/schema.py` | Done | All models: Task, TaskDescription, TaskStatus, TaskCategory, Step, StepType, StepIntent, ValidatorSpec, StepOutput, StepResult, ValidationVerdict, RefinementVerdict, ContextResult |
 | `plan/store.py` | Done | TaskStore + PlanStore with all mutation rules from spec |
 | `state.py` | Done | State with record(), resolve(), get() |
 | `plan/catalog.py` | Done | 5 Task tools + 10 Plan tools + step execution tool + check_prerequisites + 5 ContextVars |
 | `plan/planner.py` | Done | PLANNER_TOOLS (read-only), build_planner_options() |
-| `config.py` | Done | Config, ExecutorModels, ValidationConfig, BudgetConfig, HooksConfig. Load from JSON, executor_model_for(), validator_model_for(), max_validator_turns() |
+| `config.py` | Done | Config, ExecutorModels, ValidationConfig, BudgetConfig, PlanningRules, RefinerConfig, ContextBuilderConfig. Load from JSON, executor_model_for(), validator_model_for(), max_validator_turns(), default_validation_level() |
 | `__main__.py` | Done | CLI with solve/chat subcommands, --prompt/--prompt-file/--model/--config/--instance-id. File logging + plan trace |
 | `solve.py` | Done | Single mode: orchestrated via run_orchestrated(). SolveResult with patch + metrics |
 | `claude_md.py` | Done | Parse CLAUDE.md sections (file_tree, architecture, restrictions) |
 | `exec/executor.py` | Done | TOOLS_BY_STEP_TYPE sandbox, render_step_prompt, text-based JSON output capture |
 | `exec/validator.py` | Done | All 5 levels. Level 1 auto-passes without command. Levels 2-5 need validator model in config |
-| `exec/hooks.py` | Done | ruff_on_edit, commit_format_check, bash_whitelist, validator_no_write |
-| `exec/plan_executor.py` | Done | run_step() with full lifecycle: resolve, check, execute, validate, update |
+| `exec/plan_executor.py` | Done | run_step() with full lifecycle: resolve, check, execute, validate, update. Integrates context builder when enabled |
+| `exec/context_builder.py` | Done | build_context() with read-only tools (Read, Grep, Glob). Returns ContextResult with enriched_context, files_read, functions_found. Guarded by cfg.context_builder.enabled |
+| `exec/refiner.py` | Done | refine() with no-tool SDK session. Scores plans across 6 rubric dimensions (0-5 each), scaled to 0-100. Returns RefinementVerdict. Guarded by cfg.refiner.enabled |
 | `orchestrator.py` | Done | run_orchestrated() with catalog MCP injection, ContextVar binding, MCP tool name prefixing |
 | `chat.py` | Done | Interactive REPL with ClaudeSDKClient, ANSI rendering, persistent multi-turn planner session |
 
@@ -335,8 +427,8 @@ node dist/cli.js run --agent ratchet --instances id1,id2,id3 --no-vexp
 - **Home**: `C:\Users\user`
 - **Shell**: `C:\Program Files\Git\usr\bin\bash.exe`
 - **Python**: `3.14.2` → `C:\Python314\python.exe`
-- **Date/Time**: 2026-05-04 23:03:28 (SA Pacific Standard Time)
-- **Unix Timestamp**: `1777953808`
+- **Date/Time**: 2026-05-05 09:25:42 (SA Pacific Standard Time)
+- **Unix Timestamp**: `1777991142`
 
 
 
@@ -365,9 +457,10 @@ ratchet_code/
 │   └── ratchet/
 │       ├── exec/
 │       │   ├── __init__.py
+│       │   ├── context_builder.py
 │       │   ├── executor.py
-│       │   ├── hooks.py
 │       │   ├── plan_executor.py
+│       │   ├── refiner.py
 │       │   └── validator.py
 │       ├── plan/
 │       │   ├── __init__.py
@@ -389,8 +482,10 @@ ratchet_code/
 ├── bench_rubric.md
 ├── CLAUDE.md
 ├── npm
+├── output.json
 ├── pyproject.toml
 ├── ratchet.config.json
+├── refiner_rubric.md
 ├── test_context_tools.py
 ├── TEST_INTEGRATION_README.md
 ├── test_orchestrated.py
@@ -404,40 +499,24 @@ ratchet_code/
 
 ### Project Stats
 
-- **Python files**: 26
+- **Python files**: 27
 - **JS/TS files**: 0
-- **Total tracked files**: 26
+- **Total tracked files**: 27
 
 ### Git Info
 
 - **Branch**: `claude/download-claude-md-HTScD`
+  - 8058dfe docs(claude_md): update file_tree section with current repo structure
   - 7bb2cc4 feat(cli): add chat subcommand and auto-pass level 1 validator without command
   - 55cf496 refactor(catalog): unify add_*_step into add_step, auto-fill defaults, pass restrictions
-  - 1b9b713 fix(solve,validator): load config from repo path and handle nested SDK errors
 
 ### Git Status
 
-```
-  M CLAUDE.md
-   M src/ratchet/chat.py
-   M src/ratchet/exec/executor.py
-   M src/ratchet/exec/plan_executor.py
-   M src/ratchet/orchestrator.py
-   M src/ratchet/plan/catalog.py
-   M src/ratchet/plan/schema.py
-  ?? =2.0
-  ?? TEST_INTEGRATION_README.md
-  ?? bench_results/
-  ?? bench_rubric.md
-  ?? npm
-  ?? test_context_tools.py
-  ?? test_orchestrated.py
-  ?? test_prompt.txt
-  ?? test_sdk.py
-  ?? test_solve.py
-  ?? test_validator_integration.py
-  ?? test_validator_level_1.py
-  ?? test_validator_levels_2_5.py
-```
+- **Modified**: 12
+- **Staged**: 1
+- **Untracked**: 17
+- **Total**: 30 archivos
+
+
 
 ---

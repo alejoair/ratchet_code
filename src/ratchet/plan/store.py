@@ -262,6 +262,11 @@ class PlanStore:
         self._rationale: str = ""
         self._submitted: bool = False
 
+    @property
+    def is_submitted(self) -> bool:
+        """Whether the plan has been submitted."""
+        return self._submitted
+
     # -- helpers ----------------------------------------------------------
 
     def _find_step_index(self, step_id: str) -> int:
@@ -486,6 +491,18 @@ class PlanStore:
         async with self._lock:
             idx = self._find_step_index(step_id)
             return self._steps[idx].model_copy(deep=True)
+
+    async def all_steps(self) -> list[Step]:
+        """Return deep copies of all steps in insertion order.
+
+        Returns:
+            List of all steps currently in the plan.
+        """
+        async with self._lock:
+            return [
+                s.model_copy(deep=True)
+                for s in self._steps
+            ]
 
     async def get_status(self, step_id: str) -> StepStatus:
         """Retrieve the status of a step.

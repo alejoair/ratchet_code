@@ -2,21 +2,37 @@
 
 Builds a sandboxed ClaudeAgentOptions per step type, renders the step
 briefing as the user prompt, runs the SDK query, and captures the
-structured StepOutput.
+structured StepOutput via the SDK's output_format mechanism.
 """
 
-import json
 import logging
-import re
+import os
 from typing import Any
 
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ResultMessage,
+    query,
+)
 
 from ratchet.config import Config
-from ratchet.plan.schema import Step, StepOutput, StepResult, StepType
+from ratchet.plan.schema import (
+    Step,
+    StepOutput,
+    StepResult,
+    StepType,
+    sdk_output_schema,
+)
 from ratchet.state import State
 
 logger = logging.getLogger(__name__)
+
+# The parent CLI sets CLAUDECODE=1 which causes nested SDK sessions
+# to fail with exit code 1. We must strip it before spawning.
+_CLEAN_ENV = {
+    k: v for k, v in os.environ.items()
+    if k != "CLAUDECODE"
+}
 
 # ---------------------------------------------------------------------------
 # Tool sandbox per step type
@@ -44,9 +60,9 @@ def render_step_prompt(
 
     Blocks in order:
       1. Context from previous steps (if deps non-empty).
-      2. Additional context from planner (if prev_context non-empty).
+      2. Additional context from planner (if non-empty).
       3. Goal.
-      4. File declarations (target_files, creates_files, deletes_files).
+      4. File declarations.
       5. Success criterion.
 
     Args:
@@ -60,11 +76,17 @@ def render_step_prompt(
     blocks: list[str] = []
 
     if deps:
-        lines: list[str] = ["Context from previous steps:"]
+        lines: list[str] = [
+            "Context from previous steps:",
+        ]
         for sid, out in deps.items():
-            lines.append(f"  [{sid}] {out.summary}")
+            lines.append(
+                f"  [{sid}] {out.summary}"
+            )
             if out.notes:
-                lines.append(f"    Notes: {out.notes}")
+                lines.append(
+                    f"    Notes: {out.notes}"
+                )
             if out.artifacts:
                 for k, v in out.artifacts.items():
                     lines.append(f"    {k}: {v}")
@@ -85,11 +107,13 @@ def render_step_prompt(
         )
     if step.creates_files:
         blocks.append(
-            "Create files: " + ", ".join(step.creates_files)
+            "Create files: "
+            + ", ".join(step.creates_files)
         )
     if step.deletes_files:
         blocks.append(
-            "Delete files: " + ", ".join(step.deletes_files)
+            "Delete files: "
+            + ", ".join(step.deletes_files)
         )
 
     blocks.append(
@@ -100,20 +124,22 @@ def render_step_prompt(
     return "\n\n".join(blocks)
 
 
-def _unwrap_structured_output(
-    raw: Any,
+def _extract_step_output(
+    msg: ResultMessage,
 ) -> StepOutput | None:
-    """Parse StepOutput from SDK structured_output.
+    """Extract StepOutput from SDK structured_output.
 
     The SDK may wrap the output as {"output": {...}}.
-    Unwrap if the top-level dict has exactly one key "output".
+    Unwrap if the top-level dict has exactly one key
+    "output".
 
     Args:
-        raw: The structured_output value from ResultMessage.
+        msg: The final ResultMessage from the SDK.
 
     Returns:
-        A parsed StepOutput, or None if parsing fails.
+        A parsed StepOutput, or None if not found.
     """
+    raw: Any = msg.structured_output
     if raw is None:
         return None
     data: Any = raw
@@ -124,47 +150,10 @@ def _unwrap_structured_output(
     ):
         data = data["output"]
     if isinstance(data, dict):
-        return StepOutput.model_validate(data)
-    if isinstance(data, str):
-        return StepOutput.model_validate_json(data)
-    return None
-
-
-def _parse_step_output(
-    msg: ResultMessage,
-) -> StepOutput | None:
-    """Parse StepOutput from a ResultMessage text response.
-
-    The executor prompts the model to include a JSON block
-    wrapped in ```json ... ``` at the end of its response.
-    This function extracts and parses it.
-
-    Args:
-        msg: The final ResultMessage from the SDK.
-
-    Returns:
-        A parsed StepOutput, or None if no valid JSON found.
-    """
-    text = msg.result or ""
-    # Try to find a ```json ... ``` block
-    match = re.search(
-        r"```json\s*(.*?)\s*```", text, re.DOTALL,
-    )
-    if match:
         try:
-            data = json.loads(match.group(1))
             return StepOutput.model_validate(data)
-        except (json.JSONDecodeError, ValueError):
-            pass
-    # Fallback: try to parse the entire result as JSON
-    try:
-        data = json.loads(text)
-        return StepOutput.model_validate(data)
-    except (json.JSONDecodeError, ValueError):
-        pass
-    # Last resort: wrap the result text as a summary
-    if text.strip():
-        return StepOutput(summary=text.strip()[:500])
+        except ValueError:
+            return None
     return None
 
 
@@ -186,44 +175,55 @@ async def execute_step(
     Args:
         step: The step to execute.
         cfg: Active configuration.
-        repo_path: Absolute path to the target repository.
-        state: Shared state for resolving prerequisite outputs.
+        repo_path: Absolute path to the target repo.
+        state: Shared state for resolving prerequisites.
         restrictions: Project restrictions from CLAUDE.md.
         prev_context: Extra context from the planner.
 
     Returns:
-        A StepResult with output on success or error on failure.
+        A StepResult with output on success or error.
     """
     deps = state.resolve(step.depends_on)
-    prompt = render_step_prompt(step, deps, prev_context)
+    prompt = render_step_prompt(
+        step, deps, prev_context,
+    )
 
-    system_body = f"""\
-You are a code modification agent. Your job is to make the exact changes
-described below. You MUST follow these rules strictly:
-
-RULES:
-- Only modify files listed as target files. Do NOT touch any other files.
-- Do NOT create test files, verification scripts, or documentation files.
-- Do NOT delete any existing files.
-- Do NOT add comments explaining what you changed unless specifically asked.
-- Make the minimal, surgical change needed. Do not refactor surrounding code.
-- After completing the task, you MUST end your response with a JSON block
-  wrapped in ```json ... ``` containing your output in this exact schema:
-  {{"summary": "<what you did>", "artifacts": {{}}, "notes": ""}}
-  This JSON block is mandatory.
-
-TASK BRIEFING:
-{step.briefing}
-"""
+    system_body = (
+        "You are a code modification agent. "
+        "Your job is to make the exact changes "
+        "described below. You MUST follow these "
+        "rules strictly:\n\n"
+        "RULES:\n"
+        "- Only modify files listed as target "
+        "files. Do NOT touch any other files.\n"
+        "- Do NOT create test files, "
+        "verification scripts, or docs.\n"
+        "- Do NOT delete any existing files.\n"
+        "- Do NOT add comments explaining what "
+        "you changed unless specifically asked.\n"
+        "- Make the minimal, surgical change "
+        "needed. Do not refactor surrounding "
+        "code.\n\n"
+        f"TASK BRIEFING:\n{step.briefing}\n"
+    )
 
     if restrictions:
         system_body += (
-            f"\nProject restrictions:\n{restrictions}\n"
+            f"\nProject restrictions:\n"
+            f"{restrictions}\n"
         )
 
     tools = TOOLS_BY_STEP_TYPE.get(
         step.type, ["Read"],
     )
+
+    def _on_stderr(line: str) -> None:
+        logger.warning(
+            "Executor stderr [%s]: %s",
+            step.id, line,
+        )
+
+    output_schema = sdk_output_schema(StepOutput)
 
     options = ClaudeAgentOptions(
         model=cfg.executor_model_for(step.type),
@@ -233,22 +233,32 @@ TASK BRIEFING:
         allowed_tools=tools,
         max_turns=cfg.budgets.max_executor_turns,
         permission_mode="acceptEdits",
+        env=_CLEAN_ENV,
+        stderr=_on_stderr,
+        output_format={
+            "type": "json_schema",
+            "schema": output_schema,
+        },
     )
 
     last_result: ResultMessage | None = None
     try:
-        async for msg in query(prompt=prompt, options=options):
+        async for msg in query(
+            prompt=prompt, options=options,
+        ):
             if isinstance(msg, ResultMessage):
                 last_result = msg
     except Exception as exc:  # noqa: BLE001
         logger.exception(
-            "Executor session failed for step %s", step.id,
+            "Executor session failed for step %s",
+            step.id,
         )
         return StepResult(
             step_id=step.id,
             output=None,
             success=False,
             error=str(exc),
+            error_type="sdk_error",
         )
 
     if last_result is None:
@@ -256,7 +266,10 @@ TASK BRIEFING:
             step_id=step.id,
             output=None,
             success=False,
-            error="No ResultMessage received from SDK",
+            error=(
+                "No ResultMessage received from SDK"
+            ),
+            error_type="sdk_error",
         )
 
     subtype = getattr(last_result, "subtype", None)
@@ -265,21 +278,32 @@ TASK BRIEFING:
             step_id=step.id,
             output=None,
             success=False,
-            error=f"SDK session ended with subtype: {subtype}",
+            error=(
+                f"SDK session ended with "
+                f"subtype: {subtype}"
+            ),
+            error_type="sdk_error",
         )
 
-    output = _parse_step_output(last_result)
+    output = _extract_step_output(last_result)
 
     if output is None:
-        return StepResult(
-            step_id=step.id,
-            output=None,
-            success=False,
-            error=(
-                "Executor completed but produced no "
-                "parseable JSON output"
-            ),
-        )
+        # Last resort: wrap result text as summary
+        text = last_result.result or ""
+        if text.strip():
+            output = StepOutput(
+                summary=text.strip()[:500],
+            )
+        else:
+            return StepResult(
+                step_id=step.id,
+                output=None,
+                success=False,
+                error=(
+                    "Executor completed but "
+                    "produced no output"
+                ),
+            )
 
     logger.info(
         "Executor step %s completed: %s",

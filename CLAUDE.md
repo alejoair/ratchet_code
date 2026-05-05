@@ -79,6 +79,7 @@ All design documents live in the "Ratchet Code" folder on Google Drive
 - `Task`, `TaskDescription`, `TaskStatus`, `TaskCategory` — `plan/schema.py`
 - `Step`, `StepType`, `StepIntent`, `ValidatorSpec` — `plan/schema.py`
 - `StepOutput`, `StepResult`, `ValidationVerdict`, `RefinementVerdict`, `ContextResult` — `plan/schema.py`
+- `sdk_output_schema` — `plan/schema.py` (helper to build JSON schemas for SDK `output_format`)
 - `PlanStore`, `StepStatus` — `plan/store.py`
 - `TaskStore` — `plan/store.py`
 - `State` — `state.py`
@@ -278,6 +279,7 @@ The refiner scores plans across six dimensions (Goal Clarity, Dependency Correct
 | `enabled` | `bool` | `false` | Whether the context builder is active |
 | `model` | `str \| null` | `null` | Model ID for the context builder SDK session. Falls back to the executor model for the step if not set |
 | `max_turns` | `int` | `5` | Max turns for the builder SDK session |
+| `run_before` | `list[str]` | `[]` | Step types that trigger the context builder. When empty, runs before all step types |
 
 When enabled, the context builder runs a short SDK session with read-only tools (Read, Grep, Glob) to inspect the repository before each step execution. The resulting `ContextResult.enriched_context` is prepended to the executor's `prev_context` in `plan_executor.run_step()`, giving the executor precise, repo-grounded information before writing code.
 
@@ -285,16 +287,16 @@ When enabled, the context builder runs a short SDK session with read-only tools 
 
 `plan/catalog.py` — in-process MCP server (`ratchet_catalog`) with all custom tools: Task CRUD, Plan CRUD, and the `step` execution tool. All tools access state via `ContextVar`. Contains `check_prerequisites`. **Implemented**: 5 Task tools (task_create, task_get, task_update_what, task_update_status, task_delete), unified `add_step` tool (replaces per-type add_*_step tools), 9 other Plan tools (edit_step, remove_step, insert_step_after, mark_step_in_progress, mark_step_completed, mark_step_failed, view_plan, submit_plan, get_next_runnable), `step` execution tool, `check_prerequisites`, all 5 ContextVars. `bind_catalog_context(task_store, plan_store, state, repo_path, cfg)`. Tool names are registered without prefix (e.g. `task_create`); the orchestrator prefixes them with `mcp__ratchet_catalog__` for the CLI.
 
-`exec/executor.py` — `execute_step(step, cfg, repo_path, state, restrictions, prev_context) -> StepResult`. Builds options with `TOOLS_BY_STEP_TYPE` sandbox, runs SDK client, captures StepOutput via text-based JSON parsing. **Implemented**: render_step_prompt, TOOLS_BY_STEP_TYPE mapping, structured output capture with regex-based JSON extraction.
+`exec/executor.py` — `execute_step(step, cfg, repo_path, state, restrictions, prev_context) -> StepResult`. Builds options with `TOOLS_BY_STEP_TYPE` sandbox, runs SDK client, captures StepOutput via SDK `output_format` (structured JSON output). **Implemented**: render_step_prompt, TOOLS_BY_STEP_TYPE mapping, structured output via `output_format={"type": "json_schema", "schema": ...}`.
 
-`exec/validator.py` — `validate(step, result, cfg, repo_path) -> ValidationVerdict`. Level 1 is subprocess (auto-passes if no command provided); levels 2-5 are SDK clients with read-only sandbox. **Implemented**: all 5 levels, VALIDATOR_TOOLS_BY_LEVEL, render_validator_prompt. Levels 2-5 need a validator model configured in `ratchet.config.json` under `models.validator_by_level`.
+`exec/validator.py` — `validate(step, result, cfg, repo_path) -> ValidationVerdict`. Level 1 is subprocess (auto-passes if no command provided); levels 2-5 are SDK clients with read-only sandbox that return `ValidationVerdict` via SDK `output_format`. **Implemented**: all 5 levels, VALIDATOR_TOOLS_BY_LEVEL, render_validator_prompt. Levels 2-5 need a validator model configured in `ratchet.config.json` under `models.validator_by_level`.
 
 
 `exec/plan_executor.py` — `run_step(step_id, prev_context, plan_store, state, cfg, repo_path, restrictions) -> dict`. Python function that implements the `step` tool body: resolve step, check_prerequisites, mark_in_progress, execute_step, validate, mark_completed/failed, return verdict JSON. **Implemented**: full step lifecycle.
 
-`exec/context_builder.py` — `build_context(step, cfg, repo_path, deps) -> ContextResult`. Pre-execution context enrichment agent. Runs a short SDK session with read-only tools (Read, Grep, Glob) to inspect the repository and gather function signatures, import dependencies, test files, and other context relevant to the step being executed. The resulting `ContextResult.enriched_context` is prepended to the executor's `prev_context` in `plan_executor.run_step()` so the executor has precise, repo-grounded information before writing code. Guarded by `cfg.context_builder.enabled` (defaults to `False`). Uses a dedicated model from `cfg.context_builder.model`. Internal helpers: `_render_builder_prompt(step, deps)` builds the prompt from step metadata and prerequisite outputs; `_parse_context(msg)` extracts the `ContextResult` from the SDK result via regex-based JSON parsing.
+`exec/context_builder.py` — `build_context(step, cfg, repo_path, deps) -> ContextResult`. Pre-execution context enrichment agent. Runs a short SDK session with read-only tools (Read, Grep, Glob) to inspect the repository and gather function signatures, import dependencies, test files, and other context relevant to the step being executed. The resulting `ContextResult.enriched_context` is prepended to the executor's `prev_context` in `plan_executor.run_step()` so the executor has precise, repo-grounded information before writing code. Guarded by `cfg.context_builder.enabled` (defaults to `False`). Only runs for step types listed in `cfg.context_builder.run_before` (empty list = all types). Uses a dedicated model from `cfg.context_builder.model`. Returns `ContextResult` via SDK `output_format`. Receives outputs from prerequisite steps (`deps`) so it can reuse context already gathered by discovery steps. Internal helper: `_render_builder_prompt(step, deps)` builds the prompt from step metadata and prerequisite outputs.
 
-`exec/refiner.py` — `refine(steps, rationale, cfg, repo_path) -> RefinementVerdict`. Plan quality review agent. Runs on `submit_plan` (called from `catalog.py`) to evaluate the plan against a configurable rubric (`refiner_rubric.md`). Runs a no-tool SDK session that scores the plan across six dimensions (Goal Clarity, Dependency Correctness, Scope Appropriateness, File Coverage, Validation Alignment, Step Complexity), each 0-5, scaled to an overall 0-100 score. Returns a `RefinementVerdict` with `approved` (score >= `cfg.refiner.min_score`), per-dimension `rubric_scores`, `recommendations` for the planner, and `suggested_splits` for steps that are too complex. Guarded by `cfg.refiner.enabled` (defaults to `False`). Uses a dedicated model from `cfg.refiner.model`. Plans scoring below `cfg.refiner.auto_reject_below` are automatically rejected. Internal helpers: `_render_plan_text(steps, rationale)` formats the plan for the refiner prompt; `_parse_verdict(msg)` extracts the `RefinementVerdict` from the SDK result.
+`exec/refiner.py` — `refine(steps, rationale, cfg, repo_path) -> RefinementVerdict`. Plan quality review agent. Runs on `submit_plan` (called from `catalog.py`) to evaluate the plan against a configurable rubric (`refiner_rubric.md`). Runs a no-tool SDK session that scores the plan across six dimensions (Goal Clarity, Dependency Correctness, Scope Appropriateness, File Coverage, Validation Alignment, Step Complexity), each 0-5, scaled to an overall 0-100 score. Returns a `RefinementVerdict` via SDK `output_format` with `approved` (score >= `cfg.refiner.min_score`), per-dimension `rubric_scores`, `recommendations` for the planner, and `suggested_splits` for steps that are too complex. Guarded by `cfg.refiner.enabled` (defaults to `False`). Uses a dedicated model from `cfg.refiner.model`. Plans scoring below `cfg.refiner.auto_reject_below` are automatically rejected. Internal helper: `_render_plan_text(steps, rationale)` formats the plan for the refiner prompt.
 
 `orchestrator.py` — starts the planner session as a live SDK client, injects the ratchet_catalog MCP server (with ContextVars bound to active PlanStore, TaskStore, State, Config, repo_path), streams messages to/from the user. Prefixes MCP tool names with `mcp__ratchet_catalog__` in `tools` and `allowed_tools` so the CLI recognizes and auto-approves them. Logs planner activity at INFO level. **Implemented**: `run_orchestrated(repo_path, request, cfg, model) -> SolveResult`.
 
@@ -317,20 +319,20 @@ When enabled, the context builder runs a short SDK session with read-only tools 
 
 | Module | Status | Notes |
 |---|---|---|
-| `plan/schema.py` | Done | All models: Task, TaskDescription, TaskStatus, TaskCategory, Step, StepType, StepIntent, ValidatorSpec, StepOutput, StepResult, ValidationVerdict, RefinementVerdict, ContextResult |
-| `plan/store.py` | Done | TaskStore + PlanStore with all mutation rules from spec |
+| `plan/schema.py` | Done | All models + `sdk_output_schema()` helper for SDK `output_format` |
+| `plan/store.py` | Done | TaskStore + PlanStore with all mutation rules from spec. PlanStore has `is_submitted` property; `step` tool enforces plan submission before execution |
 | `state.py` | Done | State with record(), resolve(), get() |
-| `plan/catalog.py` | Done | 5 Task tools + 10 Plan tools + step execution tool + check_prerequisites + 5 ContextVars |
+| `plan/catalog.py` | Done | 5 Task tools + 10 Plan tools + step execution tool + check_prerequisites + 5 ContextVars. Step tool rejects execution if plan not submitted |
 | `plan/planner.py` | Done | PLANNER_TOOLS (read-only), build_planner_options() |
 | `config.py` | Done | Config, ExecutorModels, ValidationConfig, BudgetConfig, PlanningRules, RefinerConfig, ContextBuilderConfig. Load from JSON, executor_model_for(), validator_model_for(), max_validator_turns(), default_validation_level() |
 | `__main__.py` | Done | CLI with solve/chat subcommands, --prompt/--prompt-file/--model/--config/--instance-id. File logging + plan trace |
 | `solve.py` | Done | Single mode: orchestrated via run_orchestrated(). SolveResult with patch + metrics |
 | `claude_md.py` | Done | Parse CLAUDE.md sections (file_tree, architecture, restrictions) |
-| `exec/executor.py` | Done | TOOLS_BY_STEP_TYPE sandbox, render_step_prompt, text-based JSON output capture |
-| `exec/validator.py` | Done | All 5 levels. Level 1 auto-passes without command. Levels 2-5 need validator model in config |
+| `exec/executor.py` | Done | TOOLS_BY_STEP_TYPE sandbox, render_step_prompt, SDK `output_format` structured output |
+| `exec/validator.py` | Done | All 5 levels. Level 1 auto-passes without command. Levels 2-5 use SDK `output_format` for structured `ValidationVerdict` |
 | `exec/plan_executor.py` | Done | run_step() with full lifecycle: resolve, check, execute, validate, update. Integrates context builder when enabled |
-| `exec/context_builder.py` | Done | build_context() with read-only tools (Read, Grep, Glob). Returns ContextResult with enriched_context, files_read, functions_found. Guarded by cfg.context_builder.enabled |
-| `exec/refiner.py` | Done | refine() with no-tool SDK session. Scores plans across 6 rubric dimensions (0-5 each), scaled to 0-100. Returns RefinementVerdict. Guarded by cfg.refiner.enabled |
+| `exec/context_builder.py` | Done | build_context() with read-only tools (Read, Grep, Glob). Returns `ContextResult` via SDK `output_format`. Guarded by cfg.context_builder.enabled |
+| `exec/refiner.py` | Done | refine() with no-tool SDK session. Returns `RefinementVerdict` via SDK `output_format`. Scores plans across 6 rubric dimensions. Guarded by cfg.refiner.enabled |
 | `orchestrator.py` | Done | run_orchestrated() with catalog MCP injection, ContextVar binding, MCP tool name prefixing |
 | `chat.py` | Done | Interactive REPL with ClaudeSDKClient, ANSI rendering, persistent multi-turn planner session |
 
@@ -366,6 +368,33 @@ use these prefixed names (e.g. `mcp__ratchet_catalog__task_create`) for the
 CLI to recognize and auto-approve them. The catalog server itself registers
 tools without the prefix (e.g. `task_create`); the orchestrator adds the
 prefix when building `ClaudeAgentOptions`.
+
+**Structured output via `output_format`**: All four sub-agents (executor,
+validator, context builder, refiner) use the SDK's `output_format` parameter
+to get typed JSON output directly from the model, eliminating the need for
+regex-based parsing. The pattern is:
+
+```python
+from ratchet.plan.schema import sdk_output_schema, StepOutput
+
+options = ClaudeAgentOptions(
+    ...,
+    output_format={
+        "type": "json_schema",
+        "schema": sdk_output_schema(StepOutput),
+    },
+)
+
+# After query():
+raw = last_msg.structured_output  # dict | None
+if raw is not None:
+    result = StepOutput.model_validate(raw)
+```
+
+`sdk_output_schema()` (defined in `plan/schema.py`) generates a clean JSON
+schema from any Pydantic model, stripping Pydantic-internal keys (`title`,
+`$defs`) that the SDK does not expect. Never parse model responses with
+regex or `json.loads` — always use `output_format` + `structured_output`.
 
 ### vexp-swe-bench integration
 
@@ -427,8 +456,8 @@ node dist/cli.js run --agent ratchet --instances id1,id2,id3 --no-vexp
 - **Home**: `C:\Users\user`
 - **Shell**: `C:\Program Files\Git\usr\bin\bash.exe`
 - **Python**: `3.14.2` → `C:\Python314\python.exe`
-- **Date/Time**: 2026-05-05 09:25:42 (SA Pacific Standard Time)
-- **Unix Timestamp**: `1777991142`
+- **Date/Time**: 2026-05-05 10:52:16 (SA Pacific Standard Time)
+- **Unix Timestamp**: `1777996336`
 
 
 
@@ -477,6 +506,11 @@ ratchet_code/
 │       ├── solve.py
 │       └── state.py
 ├── temp_validator_test/
+│   ├── test_nivel1.txt
+│   ├── test_ratchet_demo.txt
+│   ├── test_simple.txt
+│   ├── test_validator.py
+│   └── test_validator.txt
 ├── .gitignore
 ├── =2.0
 ├── bench_rubric.md
@@ -499,23 +533,23 @@ ratchet_code/
 
 ### Project Stats
 
-- **Python files**: 27
+- **Python files**: 28
 - **JS/TS files**: 0
-- **Total tracked files**: 27
+- **Total tracked files**: 28
 
 ### Git Info
 
 - **Branch**: `claude/download-claude-md-HTScD`
+  - 7f84a16 docs(claude_md): update file_tree and architecture sections with current repo state
   - 8058dfe docs(claude_md): update file_tree section with current repo structure
   - 7bb2cc4 feat(cli): add chat subcommand and auto-pass level 1 validator without command
-  - 55cf496 refactor(catalog): unify add_*_step into add_step, auto-fill defaults, pass restrictions
 
 ### Git Status
 
 - **Modified**: 12
 - **Staged**: 1
-- **Untracked**: 17
-- **Total**: 30 archivos
+- **Untracked**: 18
+- **Total**: 31 archivos
 
 
 

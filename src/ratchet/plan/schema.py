@@ -124,9 +124,14 @@ class ValidatorSpec(BaseModel):
 class Step(BaseModel):
     """Core unit of execution within a plan.
 
-    Each step is created by the planner via an add_*_step tool and stored
+    Each step is created by the planner via the add_step tool and stored
     in the PlanStore. The step briefing becomes the executor's system prompt
     append; the validator spec controls post-execution validation.
+
+    File tracking fields (target_files, creates_files, deletes_files) describe
+    the step's intended file system modifications. Implementation detail fields
+    (function_signatures, imports, classes, code_snippets) provide optional
+    context about code structures and patterns relevant to the step.
     """
 
     id: str
@@ -136,6 +141,25 @@ class Step(BaseModel):
     target_files: list[str] = Field(default_factory=list)
     creates_files: list[str] = Field(default_factory=list)
     deletes_files: list[str] = Field(default_factory=list)
+    function_signatures: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Function signatures to add or modify "
+            "(e.g. 'def foo(x: int) -> str:')"
+        ),
+    )
+    imports: list[str] = Field(
+        default_factory=list,
+        description="New imports to add (e.g., 'from typing import Optional')"
+    )
+    classes: list[str] = Field(
+        default_factory=list,
+        description="Class names to create or modify (e.g., 'DataProcessor')"
+    )
+    code_snippets: list[str] = Field(
+        default_factory=list,
+        description="Relevant code fragments for context"
+    )
     depends_on: list[str] = Field(default_factory=list)
     validator: ValidatorSpec
     intent: StepIntent | None = None
@@ -156,6 +180,7 @@ class StepResult(BaseModel):
     output: StepOutput | None
     success: bool
     error: str | None = None
+    error_type: str | None = None
 
 
 class ValidationVerdict(BaseModel):
@@ -168,3 +193,98 @@ class ValidationVerdict(BaseModel):
     passed: bool
     diagnosis: str = ""
     suggested_fixes: list[str] = Field(default_factory=list)
+
+
+class RefinementVerdict(BaseModel):
+    """Verdict returned by the plan refiner on submit_plan.
+
+    The refiner evaluates the plan against a rubric and
+    returns either approval or rejection with actionable
+    recommendations.
+    """
+
+    approved: bool
+    score: int = Field(
+        ge=0,
+        le=100,
+        description=(
+            "Overall plan quality score (0-100). "
+            "Plans below the configured threshold "
+            "are rejected."
+        ),
+    )
+    diagnosis: str = ""
+    recommendations: list[str] = Field(
+        default_factory=list,
+    )
+    rubric_scores: dict[str, int] = Field(
+        default_factory=dict,
+        description=(
+            "Per-dimension rubric scores. "
+            "Keys are dimension names, values 0-5."
+        ),
+    )
+    suggested_splits: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Step IDs that are too complex and should be "
+            "split into multiple smaller steps."
+        ),
+    )
+
+
+class ContextResult(BaseModel):
+    """Enriched context produced by the context builder agent.
+
+    Returned by build_context() and prepended to the executor's
+    prev_context so the executor has precise, repo-grounded
+    information about the code it needs to modify.
+    """
+
+    enriched_context: str = Field(
+        description=(
+            "Markdown-formatted context block with "
+            "function signatures, imports, file "
+            "dependencies, and other relevant info."
+        ),
+    )
+    files_read: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Files that were read during context "
+            "building, for traceability."
+        ),
+    )
+    functions_found: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Function/class signatures discovered "
+            "in the target files."
+        ),
+    )
+    notes: str = ""
+
+
+def sdk_output_schema(
+    model_cls: type[BaseModel],
+) -> dict[str, object]:
+    """Build a JSON schema dict for Claude SDK output_format.
+
+    Strips Pydantic-internal keys (title, $defs) that the
+    SDK does not expect, keeping only type-relevant fields.
+
+    Args:
+        model_cls: A Pydantic BaseModel subclass.
+
+    Returns:
+        Dict suitable for ``ClaudeAgentOptions(
+            output_format={"type": "json_schema",
+                           "schema": result})``.
+    """
+    raw = model_cls.model_json_schema()
+    stripped: dict[str, object] = {}
+    for key, value in raw.items():
+        if key in ("title", "$defs"):
+            continue
+        stripped[key] = value
+    return stripped

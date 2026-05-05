@@ -20,7 +20,6 @@ from ratchet.config import Config
 from ratchet.plan.schema import (
     Step,
     StepIntent,
-    StepOutput,
     StepType,
     Task,
     TaskCategory,
@@ -54,6 +53,9 @@ _repo_path: ContextVar[str] = ContextVar(
     "_repo_path",
 )
 _config: ContextVar[Config] = ContextVar("_config")
+_planner_context: ContextVar["PlannerContextStore"] = ContextVar(
+    "_planner_context",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +73,47 @@ class ContextVarNotSetError(RatchetCatalogError):
 
 class PrerequisitesNotMetError(RatchetCatalogError):
     """Raised when prerequisite checks fail."""
+
+
+# ---------------------------------------------------------------------------
+# Planner context store
+# ---------------------------------------------------------------------------
+
+
+class PlannerContextStore:
+    """Simple string store for dynamic planner context.
+
+    Provides append/replace/clear operations for context that
+    persists across planner turns without modifying CLAUDE.md.
+    """
+    def __init__(self) -> None:
+        self._context: str = ""
+
+    def get(self) -> str:
+        """Return the current context string."""
+        return self._context
+
+    def set(self, content: str, mode: str = "replace") -> str:
+        """Update context content.
+
+        Args:
+            content: New context content.
+            mode: 'replace' to overwrite, 'append' to add to end,
+                  'clear' to empty then set.
+
+        Returns:
+            The updated context string.
+        """
+        if mode == "clear":
+            self._context = content
+        elif mode == "append":
+            if self._context:
+                self._context += "\n\n" + content
+            else:
+                self._context = content
+        else:  # replace (default)
+            self._context = content
+        return self._context
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +171,16 @@ def _get_config() -> Config:
         ) from exc
 
 
+def _get_planner_context() -> PlannerContextStore:
+    """Retrieve PlannerContextStore from ContextVar."""
+    try:
+        return _planner_context.get()
+    except LookupError as exc:
+        raise ContextVarNotSetError(
+            "PlannerContextStore not set."
+        ) from exc
+
+
 def _ok(data: Any) -> dict[str, Any]:
     """Wrap data in an MCP success response."""
     return {
@@ -160,6 +213,7 @@ async def check_prerequisites(
     step: Step,
     store: PlanStore,
     rp: str,
+    cfg: Config,
 ) -> list[str]:
     """Validate prerequisites before executing a step.
 
@@ -167,12 +221,14 @@ async def check_prerequisites(
       1. depends_on entries exist and are COMPLETED.
       2. For implement/update_docs: target_files exist,
          creates_files do not exist, no duplicates.
-      3. Step status is PENDING.
+      3. Step status is PENDING or FAILED.
+      4. Planning rules from config are satisfied
+         (e.g. require_discovery_before).
 
     Args:
         step: The step to validate.
         store: The active PlanStore.
-        rp: Absolute path to the repository.
+        cfg: Active configuration with planning_rules.
 
     Returns:
         List of error strings (empty if all pass).
@@ -240,13 +296,96 @@ async def check_prerequisites(
                         f"deletes_file {f!r} missing"
                     )
 
-    # Step must be PENDING
+    # Step must be PENDING or FAILED (FAILED will be
+    # auto-reset to PENDING by plan_executor.run_step).
     status = await store.get_status(step.id)
-    if status != StepStatus.PENDING:
+    if status not in (
+        StepStatus.PENDING, StepStatus.FAILED,
+    ):
         errors.append(
             f"Step {step.id!r} is {status!r}, "
-            f"expected PENDING"
+            f"expected PENDING or FAILED"
         )
+
+    # Planning rules: require_discovery_before
+    rules = cfg.planning_rules
+    if step.type.value in rules.require_discovery_before:
+        has_discovery_dep = False
+        for dep_id in step.depends_on:
+            try:
+                dep = await store.get_step(dep_id)
+                if (
+                    dep.type
+                    == StepType.DISCOVERY_STEP
+                ):
+                    has_discovery_dep = True
+            except Exception:
+                pass
+        if not has_discovery_dep:
+            errors.append(
+                f"Step type {step.type.value!r} "
+                f"requires a discovery_step "
+                f"dependency (planning_rules)"
+            )
+
+    return errors
+
+
+async def _validate_plan_rules(
+    store: PlanStore,
+    cfg: Config,
+) -> list[str]:
+    """Validate the full plan against planning rules.
+
+    Called by submit_plan to catch structural issues before
+    the planner starts executing steps.
+
+    Args:
+        store: The active PlanStore.
+        cfg: Active configuration with planning_rules.
+
+    Returns:
+        List of error strings (empty if all pass).
+    """
+    errors: list[str] = []
+    rules = cfg.planning_rules
+    steps = await store.all_steps()
+
+    if len(steps) < rules.min_steps:
+        errors.append(
+            f"Plan has {len(steps)} steps, "
+            f"minimum is {rules.min_steps}"
+        )
+
+    if len(steps) > rules.max_steps:
+        errors.append(
+            f"Plan has {len(steps)} steps, "
+            f"maximum is {rules.max_steps}"
+        )
+
+    # require_discovery_before: for each step whose type is
+    # listed, verify at least one depends_on is discovery_step
+    if rules.require_discovery_before:
+        step_by_id: dict[str, Step] = {
+            s.id: s for s in steps
+        }
+        for step in steps:
+            if step.type.value not in (
+                rules.require_discovery_before
+            ):
+                continue
+            has_discovery = any(
+                step_by_id.get(dep_id) is not None
+                and step_by_id[dep_id].type
+                == StepType.DISCOVERY_STEP
+                for dep_id in step.depends_on
+            )
+            if not has_discovery:
+                errors.append(
+                    f"Step {step.id!r} "
+                    f"({step.type.value}) requires "
+                    f"a discovery_step dependency"
+                )
 
     return errors
 
@@ -480,6 +619,37 @@ _ADD_STEP_SCHEMA: dict[str, Any] = {
                 "(for implement_step only)."
             ),
         },
+        "function_signatures": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Function signatures to add or modify "
+                "(e.g. 'def process_data(items: list[str]) -> dict[str, int]:')."
+            ),
+        },
+        "imports": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "New imports to add "
+                "(e.g. 'from typing import Optional')."
+            ),
+        },
+        "classes": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Class names to create or modify "
+                "(e.g. 'DataProcessor')."
+            ),
+        },
+        "code_snippets": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Relevant code fragments for context."
+            ),
+        },
         "depends_on": {
             "type": "array",
             "items": {"type": "string"},
@@ -560,6 +730,38 @@ _EDIT_STEP_SCHEMA: dict[str, Any] = {
                     "type": "array",
                     "items": {"type": "string"},
                 },
+                "function_signatures": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Function signatures to add or "
+                        "modify (e.g. 'def foo(x: int) "
+                        "-> str:')."
+                    ),
+                },
+                "imports": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "New imports to add "
+                        "(e.g. 'from typing import Optional')."
+                    ),
+                },
+                "classes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Class names to create or modify "
+                        "(e.g. 'DataProcessor')."
+                    ),
+                },
+                "code_snippets": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Relevant code fragments for context."
+                    ),
+                },
                 "depends_on": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -620,6 +822,22 @@ _INSERT_STEP_AFTER_SCHEMA: dict[str, Any] = {
                     "items": {"type": "string"},
                 },
                 "deletes_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "function_signatures": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "imports": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "classes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "code_snippets": {
                     "type": "array",
                     "items": {"type": "string"},
                 },
@@ -692,6 +910,33 @@ _STEP_SCHEMA: dict[str, Any] = {
         },
     },
     "required": [],
+}
+
+_UPDATE_CONTEXT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "content": {
+            "type": "string",
+            "description": (
+                "Context content to inject."
+            ),
+        },
+        "mode": {
+            "type": "string",
+            "enum": ["replace", "append", "clear"],
+            "description": (
+                "Update mode: 'replace' overwrites existing context, "
+                "'append' adds to the end, 'clear' empties then sets."
+            ),
+        },
+    },
+    "required": ["content"],
+}
+
+_GET_CONTEXT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
 }
 
 
@@ -937,6 +1182,14 @@ def _add_step_handler_impl(
             "deletes_files", [],
         )
 
+    # Add implementation detail fields if provided
+    impl_fields = [
+        "function_signatures", "imports", "classes", "code_snippets",
+    ]
+    for field in impl_fields:
+        if field in args:
+            common[field] = args[field]
+
     step = Step.model_validate(common)
     return store, step
 
@@ -1112,7 +1365,46 @@ async def _submit_plan_handler(
     """Handle submit_plan tool calls."""
     try:
         store = _get_plan_store()
+        cfg = _get_config()
         rationale: str = args["rationale"]
+
+        # Validate planning rules before accepting
+        rule_errors = await _validate_plan_rules(
+            store, cfg,
+        )
+        if rule_errors:
+            return _err(
+                RatchetCatalogError(
+                    "Plan validation failed:\n"
+                    + "\n".join(
+                        f"- {e}" for e in rule_errors
+                    )
+                )
+            )
+
+        # Run refiner agent if enabled
+        if cfg.refiner.enabled:
+            from ratchet.exec.refiner import refine
+
+            rp = _get_repo_path()
+            steps = await store.all_steps()
+            verdict = await refine(
+                steps, rationale, cfg, rp,
+            )
+            if not verdict.approved:
+                recs = "\n".join(
+                    f"- {r}"
+                    for r in verdict.recommendations
+                )
+                return _err(
+                    RatchetCatalogError(
+                        f"Plan rejected by refiner "
+                        f"(score={verdict.score}): "
+                        f"{verdict.diagnosis}\n"
+                        f"Recommendations:\n{recs}"
+                    )
+                )
+
         await store.submit(rationale)
         return _ok({
             "submitted": True,
@@ -1135,8 +1427,11 @@ async def _submit_plan_handler(
 
 @tool(
     "step",
-    "Execute the next runnable step, "
-    "or a specific step_id.",
+    "Execute the next runnable step, or a "
+    "specific step_id. Returns result with "
+    "error_type: null or 'sdk_error'. If "
+    "'sdk_error', failure is infrastructure "
+    "-- do NOT create fix-up steps.",
     _STEP_SCHEMA,
 )
 async def _step_handler(
@@ -1144,139 +1439,88 @@ async def _step_handler(
 ) -> dict[str, Any]:
     """Handle step execution tool calls.
 
-    Implements the step tool body from the spec:
-      1. Resolve target step.
-      2. Check prerequisites.
-      3. Mark in progress.
-      4. Execute via executor.
-      5. Validate via validator.
-      6. Mark completed/failed.
-      7. Return verdict JSON to planner.
+    This is a thin wrapper around run_step().
+    All actual logic lives in plan_executor.run_step().
     """
     try:
+        # Get dependencies from ContextVars
         store = _get_plan_store()
         state = _get_state()
         cfg = _get_config()
         rp = _get_repo_path()
 
-        # 1. Resolve step_id
-        step_id: str | None = (
-            args.get("step_id") or None
-        )
-        if step_id is None:
-            step_id = await store.next_runnable_id()
-        if step_id is None:
-            return _ok({
-                "status": "no_runnable_step",
-                "message": (
-                    "No runnable step available."
-                ),
-            })
+        # Guard: plan must be submitted before execution
+        if not store.is_submitted:
+            return _err(RatchetCatalogError(
+                "Plan has not been submitted yet. "
+                "Call submit_plan before executing "
+                "steps."
+            ))
 
-        step = await store.get_step(step_id)
+        # Extract args
+        step_id = args.get("step_id")
+        prev_context = args.get("prev_context", "")
 
-        # 2. Check prerequisites
-        prereq_errors = await check_prerequisites(
-            step, store, rp,
-        )
-        if prereq_errors:
-            return _err(
-                PrerequisitesNotMetError(
-                    "Prerequisites not met: "
-                    + "; ".join(prereq_errors)
-                )
-            )
+        # Lazy import to avoid circular dependency
+        from ratchet.exec.plan_executor import run_step
 
-        # 3. Mark in progress
-        await store.mark_in_progress(step_id)
-
-        # 4. Execute (lazy imports to avoid
-        #    circular deps at module load)
-        from ratchet.exec.executor import (  # noqa: PLC0415
-            execute_step,
-        )
-        from ratchet.exec.validator import (  # noqa: PLC0415
-            validate,
-        )
-
-        # Build prev_context: planner-provided + auto from State
-        planner_ctx: str = args.get("prev_context", "")
-        deps = state.resolve(step.depends_on)
-        auto_ctx_parts: list[str] = []
-        for sid, out in deps.items():
-            auto_ctx_parts.append(
-                f"[{sid}] {out.summary}"
-            )
-        auto_ctx = '\n'.join(auto_ctx_parts)
-        if planner_ctx and auto_ctx:
-            prev_ctx = auto_ctx + '\n\n' + planner_ctx
-        else:
-            prev_ctx = planner_ctx or auto_ctx
-
-        restrictions = cfg.restrictions
-
-        result = await execute_step(
-            step=step,
-            cfg=cfg,
-            repo_path=rp,
+        # Delegate to single source of truth
+        result = await run_step(
+            step_id=step_id,
+            prev_context=prev_context,
+            plan_store=store,
             state=state,
-            restrictions=restrictions,
-            prev_context=prev_ctx,
-        )
-
-        # 5. Validate
-        verdict = await validate(
-            step=step,
-            result=result,
             cfg=cfg,
             repo_path=rp,
+            restrictions=cfg.restrictions,
         )
 
-        # 6. Mark completed/failed
-        if result.success and verdict.passed:
-            output = result.output or StepOutput(
-                summary="Step completed",
-            )
-            await store.mark_completed(
-                step_id, output, verdict,
-            )
-            state.record(step_id, output)
-        else:
-            await store.mark_failed(step_id, verdict)
-
-        logger.info(
-            "Step %s: success=%s verdict=%s",
-            step_id,
-            result.success,
-            verdict.passed,
-        )
-
-        # 7. Return verdict JSON
-        return _ok({
-            "step_id": step_id,
-            "status": (
-                "completed"
-                if verdict.passed
-                else "failed"
-            ),
-            "output": (
-                result.output.model_dump(
-                    mode="json",
-                )
-                if result.output
-                else None
-            ),
-            "verdict": verdict.model_dump(
-                mode="json",
-            ),
-        })
-    except (
-        RatchetCatalogError,
-        RatchetStoreError,
-    ) as exc:
-        return _err(exc)
+        return _ok(result)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Error in step")
+        logger.exception("Error in step tool")
+        return _err(exc)
+
+
+@tool(
+    "update_context",
+    "Update the dynamic planner context that persists across turns. "
+    "Use this to inject information discovered during execution "
+    "that the planner should know about in future turns.",
+    _UPDATE_CONTEXT_SCHEMA,
+)
+async def _update_context_handler(**kwargs: Any) -> dict[str, Any]:
+    """Handle update_context tool calls."""
+    try:
+        store = _get_planner_context()
+        content = kwargs.get("content", "")
+        mode = kwargs.get("mode", "replace")
+        updated = store.set(content, mode)
+        return _ok({
+            "status": "updated",
+            "context": updated,
+            "mode": mode,
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Error in update_context")
+        return _err(exc)
+
+
+@tool(
+    "get_context",
+    "Retrieve the current dynamic planner context.",
+    _GET_CONTEXT_SCHEMA,
+)
+async def _get_context_handler(**kwargs: Any) -> dict[str, Any]:
+    """Handle get_context tool calls."""
+    try:
+        store = _get_planner_context()
+        current = store.get()
+        return _ok({
+            "context": current,
+            "empty": len(current.strip()) == 0,
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Error in get_context")
         return _err(exc)
 
 
@@ -1301,11 +1545,17 @@ PLAN_TOOL_NAMES: list[str] = [
     "submit_plan",
 ]
 
+CONTEXT_TOOL_NAMES: list[str] = [
+    "update_context",
+    "get_context",
+]
+
 STEP_TOOL_NAME: str = "step"
 
 ALL_TOOL_NAMES: list[str] = (
     TASK_TOOL_NAMES
     + PLAN_TOOL_NAMES
+    + CONTEXT_TOOL_NAMES
     + [STEP_TOOL_NAME]
 )
 
@@ -1323,6 +1573,9 @@ _ALL_HANDLERS = [
     _insert_step_after_handler,
     _view_plan_handler,
     _submit_plan_handler,
+    # Context tools
+    _update_context_handler,
+    _get_context_handler,
     # Step execution
     _step_handler,
 ]
@@ -1368,3 +1621,4 @@ def bind_catalog_context(
     _state.set(state)
     _repo_path.set(repo_path)
     _config.set(cfg)
+    _planner_context.set(PlannerContextStore())

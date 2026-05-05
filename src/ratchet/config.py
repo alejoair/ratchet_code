@@ -88,33 +88,84 @@ class BudgetConfig(BaseModel):
     max_total_steps: int = 50
 
 
-class HooksConfig(BaseModel):
-    """Hook configuration for executor sessions.
+class PlanningRules(BaseModel):
+    """Enforced planning constraints checked at submit and execution.
 
     Attributes:
-        ruff_on_edit: Run ruff format/check after edits.
-        commit_format_check: Validate commit message format.
-        bash_allowlist: Shell commands allowed without prompting.
-        commit_message_pattern: Regex for commit message validation.
+        require_discovery_before: Step types that require at least
+            one completed discovery_step in their depends_on list.
+        max_steps: Maximum number of steps allowed in a plan.
+        min_steps: Minimum number of steps required in a plan.
     """
 
-    ruff_on_edit: bool = True
-    commit_format_check: bool = True
-    bash_allowlist: list[str] = []
-    commit_message_pattern: str = ""
+    require_discovery_before: list[str] = [
+        "implement_step",
+    ]
+    max_steps: int = 50
+    min_steps: int = 0
+
+
+class RefinerConfig(BaseModel):
+    """Configuration for the plan refinement agent.
+
+    The refiner runs on submit_plan and evaluates the plan
+    against a rubric, returning approval or rejection with
+    actionable recommendations.
+
+    Attributes:
+        enabled: Whether the refiner agent is active.
+        model: Model ID for the refiner SDK session.
+        rubric_path: Path to the rubric .md file.
+        max_turns: Max turns for the refiner session.
+        min_score: Minimum score (0-100) to approve a plan.
+        auto_reject_below: Score below which the plan is
+            rejected outright with no recommendations.
+    """
+
+    enabled: bool = False
+    model: str | None = None
+    rubric_path: str = "refiner_rubric.md"
+    max_turns: int = 3
+    min_score: int = 60
+    auto_reject_below: int = 30
+
+
+class ContextBuilderConfig(BaseModel):
+    """Configuration for the context builder agent.
+
+    The context builder runs before each step execution to
+    enrich the step briefing with precise, repo-grounded
+    information: function signatures, import dependencies,
+    file relationships, and other relevant context.
+
+    Attributes:
+        enabled: Whether the context builder is active.
+        model: Model ID for the context builder session.
+        max_turns: Max turns for the builder session.
+        run_before: Step types that trigger the context
+            builder. When empty, runs before all step
+            types.
+    """
+
+    enabled: bool = False
+    model: str | None = None
+    max_turns: int = 5
+    run_before: list[str] = []
 
 
 class Config(BaseModel):
     """Top-level ratchet configuration.
 
     Loaded from ``ratchet.config.json`` and used throughout the
-    executor, validator, hooks, and orchestrator modules.
+    executor, validator, and orchestrator modules.
 
     Attributes:
         models: Model selection for planner, executor, and validator.
         validation: Default validation level and turn budgets.
         budgets: Global limits for executor and planner sessions.
-        hooks: Hook configuration for code quality enforcement.
+        planning_rules: Enforced constraints on plan structure.
+        refiner: Plan refinement agent configuration.
+        context_builder: Context builder agent configuration.
         restrictions: Parsed restrictions from CLAUDE.md, injected
             into executor system prompts.
     """
@@ -122,7 +173,11 @@ class Config(BaseModel):
     models: dict[str, Any]
     validation: ValidationConfig = ValidationConfig()
     budgets: BudgetConfig = BudgetConfig()
-    hooks: HooksConfig = HooksConfig()
+    planning_rules: PlanningRules = PlanningRules()
+    refiner: RefinerConfig = RefinerConfig()
+    context_builder: ContextBuilderConfig = (
+        ContextBuilderConfig()
+    )
     restrictions: str = ""
 
     @classmethod

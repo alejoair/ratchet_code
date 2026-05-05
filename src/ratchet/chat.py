@@ -38,7 +38,19 @@ _RED = "\033[31m"
 _GREEN = "\033[32m"
 _CYAN = "\033[36m"
 _YELLOW = "\033[33m"
+_MAGENTA = "\033[35m"
+_BLUE = "\033[34m"
 _RESET = "\033[0m"
+
+# Unicode symbols for visual indicators
+_THINKING_SYMBOL = "◇"
+_TOOL_SYMBOL = "▶"
+_RESULT_SYMBOL = "◀"
+_SUCCESS_SYMBOL = "✓"
+_ERROR_SYMBOL = "✗"
+_INFO_SYMBOL = "ℹ"
+_DONE_SYMBOL = "✔"
+_FAIL_SYMBOL = "✖"
 
 _ = re.sub  # used below
 _ = json.dumps  # used below
@@ -66,7 +78,7 @@ def _render_text_block(block: TextBlock) -> None:
     """Render a TextBlock to stdout."""
     text = block.text.strip()
     if text:
-        print(f"{_BOLD}{text}{_RESET}")
+        print(f"\n\n{text}")
 
 
 def _render_thinking_block(block: ThinkingBlock) -> None:
@@ -79,8 +91,11 @@ def _render_thinking_block(block: ThinkingBlock) -> None:
     if len(lines) > 5:
         extra = len(lines) - 5
         preview += f"\n{_DIM}... ({extra} more lines){_RESET}"
-    header = f"{_DIM}{_YELLOW}[thinking]{_RESET}"
-    print(f"\n{header}\n{_DIM}{preview}{_RESET}")
+
+    print(f"\n{_DIM}{'─' * 60}{_RESET}")
+    print(f"{_MAGENTA}{_THINKING_SYMBOL} Thinking{_RESET}")
+    print(f"{_DIM}{preview}{_RESET}")
+    print(f"{_DIM}{'─' * 60}{_RESET}")
 
 
 def _render_tool_use(
@@ -90,17 +105,20 @@ def _render_tool_use(
     short_name = block.name.replace(
         "mcp__ratchet_catalog__", "",
     )
-    raw = json.dumps(block.input, default=str)
-    display = _truncate(_truncate(raw, 200), 120)
-    print(
-        f"\n{_CYAN}>> {short_name}{_RESET} "
-        f"{_DIM}({display}){_RESET}"
-    )
+    raw = json.dumps(block.input, default=str, indent=2)
+    display = _truncate(raw, 150)
+    print(f"\n\n{_CYAN}{_TOOL_SYMBOL} {_BOLD}{short_name}{_RESET}")
+    if display:
+        indented = "\n".join(
+            f"  {line}" for line in display.split("\n")
+        )
+        print(f"{_DIM}{indented}{_RESET}")
 
 
 def _render_tool_result(block: ToolResultBlock) -> None:
     """Render a tool result block to stdout."""
-    tag = f"{_RED}ERR" if block.is_error else f"{_GREEN}OK"
+    symbol = _ERROR_SYMBOL if block.is_error else _SUCCESS_SYMBOL
+    color = _RED if block.is_error else _GREEN
     content = block.content
     if isinstance(content, str):
         text = _truncate(content, 200)
@@ -111,7 +129,14 @@ def _render_tool_result(block: ToolResultBlock) -> None:
             "(empty)" if content is None
             else _truncate(str(content), 200)
         )
-    print(f"{_CYAN}<< {tag}{_RESET} {text}")
+    if text:
+        indented = "\n".join(
+            f"  {line}" for line in text.split("\n")
+        )
+        print(f"\n\n{_CYAN}{_RESULT_SYMBOL} {color}{symbol}{_RESET}")
+        print(f"{_DIM}{indented}{_RESET}")
+    else:
+        print(f"\n\n{_CYAN}{_RESULT_SYMBOL} {color}{symbol}{_RESET} {_DIM}(empty){_RESET}")
 
 
 def _render_server_result(
@@ -119,9 +144,16 @@ def _render_server_result(
 ) -> None:
     """Render a server tool result block to stdout."""
     content_str = _truncate(
-        json.dumps(block.content, default=str), 200,
+        json.dumps(block.content, default=str, indent=2), 200,
     )
-    print(f"{_CYAN}<< {_GREEN}OK{_RESET} {content_str}")
+    if content_str:
+        indented = "\n".join(
+            f"  {line}" for line in content_str.split("\n")
+        )
+        print(f"\n\n{_CYAN}{_RESULT_SYMBOL} {_GREEN}{_SUCCESS_SYMBOL}{_RESET}")
+        print(f"{_DIM}{indented}{_RESET}")
+    else:
+        print(f"\n\n{_CYAN}{_RESULT_SYMBOL} {_GREEN}{_SUCCESS_SYMBOL}{_RESET} {_DIM}(empty){_RESET}")
 
 
 def _render_assistant_message(
@@ -149,28 +181,30 @@ def _render_result_message(msg: ResultMessage) -> None:
     usage = msg.usage or {}
     inp = usage.get("input_tokens", 0) or 0
     out = usage.get("output_tokens", 0) or 0
-    tag = (
-        f"{_RED}error{_RESET}" if msg.is_error
-        else f"{_GREEN}done{_RESET}"
-    )
+    symbol = _FAIL_SYMBOL if msg.is_error else _DONE_SYMBOL
+    color = _RED if msg.is_error else _GREEN
     seconds = duration / 1000
-    print(
-        f"\n{_BOLD}[{tag}]{_RESET} "
-        f"turns={turns} tokens={inp}+{out} "
-        f"cost=${cost:.4f} duration={seconds:.1f}s"
-    )
+
+    print(f"\n\n{_DIM}{'═' * 60}{_RESET}")
+    print(f"{_BOLD}{color}{symbol} Session Summary{_RESET}")
+    print(f"{_DIM}{'─' * 60}{_RESET}")
+    print(f"  Turns:        {_BOLD}{turns}{_RESET}")
+    print(f"  Tokens:       {_BOLD}{inp:,}{_RESET} in + {_BOLD}{out:,}{_RESET} out")
+    print(f"  Cost:         {_BOLD}${cost:.4f}{_RESET}")
+    print(f"  Duration:     {_BOLD}{seconds:.1f}s{_RESET}")
+    print(f"{_DIM}{'═' * 60}{_RESET}")
 
 
 def _render_system_message(msg: SystemMessage) -> None:
     """Render a system notification."""
     text = (
         str(msg) if not isinstance(msg, dict)
-        else json.dumps(msg)
+        else json.dumps(msg, indent=2)
     )
-    print(
-        f"{_DIM}{_YELLOW}[system] "
-        f"{_truncate(text, 200)}{_RESET}"
-    )
+    truncated = _truncate(text, 200)
+    print(f"\n{_BLUE}{_INFO_SYMBOL} System{_RESET}")
+    if truncated:
+        print(f"{_DIM}{truncated}{_RESET}")
 
 
 def _render_rate_limit(event: RateLimitEvent) -> None:
@@ -178,8 +212,8 @@ def _render_rate_limit(event: RateLimitEvent) -> None:
     info = event.rate_limit_info
     ms = getattr(info, "resets_in_ms", "?")
     print(
-        f"{_YELLOW}[rate-limit] "
-        f"resets in {ms}ms{_RESET}"
+        f"{_YELLOW}{_INFO_SYMBOL} Rate limit{_RESET} "
+        f"{_DIM}resets in {ms}ms{_RESET}"
     )
 
 
@@ -205,11 +239,18 @@ _PLANNER_SYSTEM_PROMPT = (
     "4. Use submit_plan to lock the plan.\n"
     "5. Use step() to execute each step.\n"
     "6. Review the verdict and adjust.\n\n"
+    "Step error handling:\n"
+    "- error_type='sdk_error' means infrastructure "
+    "failure, NOT a code problem. Do NOT create "
+    "fix-up steps. Just retry the step once.\n"
+    "- error_type=null and status='failed' means "
+    "a real problem. Read the verdict and adjust.\n\n"
     "Guidelines:\n"
     "- Read files BEFORE creating the plan.\n"
     "- Make minimal changes to fix the issue.\n"
     "- Each step briefing must be self-contained.\n"
     "- The executor has NO memory between steps.\n"
+    "- For implement_step, optionally specify function_signatures, imports, classes, or code_snippets to make the implementation scope more explicit.\n"
 )
 
 

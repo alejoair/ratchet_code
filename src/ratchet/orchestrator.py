@@ -90,10 +90,18 @@ which launches a separate executor agent with write access.
 Workflow:
 1. Use task_create to define the task.
 2. Read the relevant source files to understand the codebase.
-3. Use add_*_step tools to build a plan with clear goals and briefings.
+3. Use add_step to build a plan with clear goals and briefings.
 4. Use submit_plan to lock the plan.
 5. Use step() to execute each step sequentially.
 6. Review the verdict after each step and adjust if needed.
+
+Step error handling:
+- When step() returns error_type="sdk_error", it means the
+  SDK infrastructure failed (not a code problem).
+  Do NOT create fix-up steps. Just retry the step once.
+- When step() returns error_type=null and status="failed",
+  the executor or validator found a real problem.
+  Read the verdict diagnosis and adjust the plan.
 
 Guidelines:
 - Read the relevant source files BEFORE creating the plan.
@@ -108,6 +116,7 @@ Guidelines:
   line numbers, and exact instructions for the executor.
 - The executor has NO memory between steps -- include all context
   the executor needs in the step briefing.
+- For implement_step, optionally specify function_signatures, imports, classes, or code_snippets to make the implementation scope more explicit.
 """
 
 

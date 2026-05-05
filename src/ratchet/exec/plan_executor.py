@@ -11,33 +11,12 @@ from typing import Any
 from ratchet.config import Config
 from ratchet.exec.executor import execute_step
 from ratchet.exec.validator import validate
+from ratchet.plan.catalog import check_prerequisites
 from ratchet.plan.schema import StepOutput
-from ratchet.plan.store import PlanStore, StepStatus
+from ratchet.plan.store import PlanStore
 from ratchet.state import State
 
 logger = logging.getLogger(__name__)
-
-
-async def _check_deps(
-    step_id: str,
-    plan_store: PlanStore,
-) -> list[str] | None:
-    """Check prerequisites for a step.
-
-    Args:
-        step_id: The step to check.
-        plan_store: The active plan store.
-
-    Returns:
-        None if all met, list of unmet dep IDs otherwise.
-    """
-    step = await plan_store.get_step(step_id)
-    unmet: list[str] = []
-    for dep_id in step.depends_on:
-        status = await plan_store.get_status(dep_id)
-        if status != StepStatus.COMPLETED:
-            unmet.append(dep_id)
-    return unmet if unmet else None
 
 
 async def run_step(
@@ -55,6 +34,9 @@ async def run_step(
     step (or picks the next runnable one), checks prerequisites,
     runs the executor and validator, updates the plan store and
     state, and returns the verdict JSON to the planner.
+
+    If the step is FAILED, it is automatically reset to PENDING
+    so it can be re-executed without requiring edit_step first.
 
     Args:
         step_id: Explicit step ID, or None to auto-pick.
@@ -79,17 +61,75 @@ async def run_step(
 
     step = await plan_store.get_step(step_id)
 
+    # Auto-reset FAILED steps so they can be re-executed
+    status = await plan_store.get_status(step_id)
+    if status.value == "failed":
+        # edit_step with empty updates resets
+        # FAILED -> PENDING per store rules
+        await plan_store.edit_step(
+            step_id, {},
+        )
+        logger.info(
+            "Auto-reset step %s from "
+            "FAILED to PENDING for retry",
+            step_id,
+        )
+        # Refresh step after edit
+        step = await plan_store.get_step(step_id)
+
     # Check prerequisites
-    unmet = await _check_deps(step_id, plan_store)
-    if unmet is not None:
+    prereq_errors = await check_prerequisites(
+        step, plan_store, repo_path, cfg,
+    )
+    if prereq_errors:
         return {
             "status": "prerequisites_not_met",
             "step_id": step_id,
-            "unmet_deps": unmet,
+            "errors": prereq_errors,
         }
 
     # Mark in progress
     await plan_store.mark_in_progress(step_id)
+
+    # Build full context from dependencies and planner input
+    deps = state.resolve(step.depends_on)
+    auto_ctx_parts: list[str] = [
+        f"[{sid}] {out.summary}"
+        for sid, out in deps.items()
+    ]
+    auto_ctx = '\n'.join(auto_ctx_parts)
+
+    # Run context builder if enabled and step type matches
+    enriched = ""
+    builder_cfg = cfg.context_builder
+    if builder_cfg.enabled:
+        run_before = builder_cfg.run_before
+        should_run = (
+            not run_before
+            or step.type.value in run_before
+        )
+        if should_run:
+            from ratchet.exec.context_builder import (
+                build_context,
+            )
+
+            ctx_result = await build_context(
+                step, cfg, repo_path, deps,
+            )
+            if ctx_result.enriched_context:
+                enriched = (
+                    ctx_result.enriched_context
+                )
+
+    # Assemble full context: deps + enriched + planner
+    ctx_parts: list[str] = []
+    if auto_ctx:
+        ctx_parts.append(auto_ctx)
+    if enriched:
+        ctx_parts.append(enriched)
+    if prev_context:
+        ctx_parts.append(prev_context)
+    full_context = "\n\n".join(ctx_parts)
 
     # Execute
     result = await execute_step(
@@ -98,7 +138,7 @@ async def run_step(
         repo_path=repo_path,
         state=state,
         restrictions=restrictions,
-        prev_context=prev_context,
+        prev_context=full_context,
     )
 
     # Validate
@@ -135,5 +175,10 @@ async def run_step(
         "step_id": step_id,
         "executor_success": result.success,
         "error": result.error,
+        "error_type": getattr(result, "error_type", None),
+        "output": (
+            result.output.model_dump(mode="json")
+            if result.output else None
+        ),
         "verdict": verdict.model_dump(mode="json"),
     }

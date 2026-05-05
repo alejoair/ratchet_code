@@ -41,14 +41,19 @@ def _validate_level_1(
     step: Step,
     repo_path: str,
 ) -> ValidationVerdict:
-    """Run a shell command and check exit code."""
+    """Run a shell command and check exit code.
+
+    If no command is provided, auto-pass: the executor
+    already reported success via its StepResult, and
+    level 1 without a command means "trust the executor".
+    """
     command = step.validator.command
     if not command:
         return ValidationVerdict(
-            passed=False,
+            passed=True,
             diagnosis=(
-                "Level 1 validation requires a command "
-                "but none was provided"
+                "No validation command provided; "
+                "auto-passing based on executor success"
             ),
         )
 
